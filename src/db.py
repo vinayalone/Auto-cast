@@ -61,6 +61,17 @@ async def init_db():
                 PRIMARY KEY (user_id, channel_id)
             );
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS apscheduler_jobs (
+                id            VARCHAR(191) PRIMARY KEY,
+                next_run_time DOUBLE PRECISION,
+                job_state     BYTEA NOT NULL
+            );
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS ix_apscheduler_jobs_next_run_time
+            ON apscheduler_jobs (next_run_time);
+        """)
     logger.info("✅ Database initialized")
 
 # ------------------- Encryption -------------------

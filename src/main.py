@@ -1,7 +1,5 @@
 import asyncio
 import logging
-import os
-from concurrent.futures import ThreadPoolExecutor
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from src.config import API_ID, API_HASH, BOT_TOKEN, validate_env
@@ -22,30 +20,6 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 globals.app = app
-
-
-def _run_migrations_sync():
-    """Run Alembic migrations in a thread (sync, uses psycopg2)."""
-    from alembic.config import Config
-    from alembic import command
-
-    url = os.environ.get("DATABASE_URL", "")
-    for prefix in ("postgresql+asyncpg://", "postgres+asyncpg://"):
-        if url.startswith(prefix):
-            url = "postgresql://" + url[len(prefix):]
-    if url.startswith("postgres://"):
-        url = "postgresql://" + url[len("postgres://"):]
-
-    # Resolve alembic.ini relative to project root (one level up from src/)
-    ini_path = os.path.join(os.path.dirname(__file__), "..", "alembic.ini")
-    ini_path = os.path.abspath(ini_path)
-
-    cfg = Config(ini_path)
-    cfg.set_main_option("sqlalchemy.url", url)
-    # Also tell Alembic where the project root is so migrations/ is found
-    cfg.set_main_option("prepend_sys_path", os.path.dirname(ini_path))
-    command.upgrade(cfg, "head")
-    logger.info("✅ Alembic migrations complete")
 
 
 @app.on_message(filters.command(["start", "manage"]))
@@ -80,11 +54,9 @@ async def callback_query_handler(client, callback_query):
 async def main():
     validate_env()
 
-    loop = asyncio.get_running_loop()
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        await loop.run_in_executor(pool, _run_migrations_sync)
-
+    # init_db() uses CREATE TABLE IF NOT EXISTS — idempotent, no Alembic needed
     await init_db()
+    logger.info("✅ Database ready")
 
     global scheduler
     scheduler = setup_scheduler()

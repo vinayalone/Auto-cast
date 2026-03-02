@@ -18,7 +18,7 @@ app = Client(
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    in_memory=True  # don't write session file to disk (wiped on redeploy)
+    workdir="/tmp"  # /tmp persists within a deployment, avoids DC re-negotiation
 )
 globals.app = app
 
@@ -51,6 +51,12 @@ async def private_message_handler(client, message):
 @app.on_callback_query()
 async def callback_query_handler(client, callback_query):
     await callback_router(client, callback_query)
+
+
+@app.on_message()
+async def debug_all_messages(client, message):
+    """Temporary: log every single message received to diagnose handler issue."""
+    logger.info(f"📩 RAW MSG: chat_type={message.chat.type} text={repr(message.text)} from={message.from_user.id if message.from_user else None}")
 
 
 async def main():

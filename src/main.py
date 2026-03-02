@@ -17,7 +17,8 @@ app = Client(
     "autocast_bot",
     api_id=API_ID,
     api_hash=API_HASH,
-    bot_token=BOT_TOKEN
+    bot_token=BOT_TOKEN,
+    in_memory=True  # don't write session file to disk (wiped on redeploy)
 )
 globals.app = app
 
@@ -25,6 +26,7 @@ globals.app = app
 @app.on_message(filters.command(["start", "manage"]))
 async def start_command(client, message):
     uid = message.from_user.id
+    logger.info(f"📨 /start received from uid={uid}")
     if uid not in globals.user_state:
         globals.user_state[uid] = {}
     from src.db import get_session

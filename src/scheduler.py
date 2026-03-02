@@ -10,6 +10,9 @@ from apscheduler.executors.asyncio import AsyncIOExecutor
 from pyrogram import Client, errors
 from pyrogram.types import Message
 from src.config import DATABASE_URL, DEFAULT_TZ, API_ID, API_HASH
+
+# APScheduler's SQLAlchemyJobStore needs a plain psycopg2 URL (no +asyncpg)
+_SYNC_DB_URL = DATABASE_URL.replace('postgresql+asyncpg://', 'postgresql://').replace('postgres+asyncpg://', 'postgresql://')
 from src.db import (
     get_session, get_single_task, delete_task, update_last_msg,
     update_next_run, increment_fail_count, reset_fail_count,
@@ -200,8 +203,7 @@ async def notify_user_and_disable(task):
 def setup_scheduler():
     global scheduler
     jobstores = {
-        # APScheduler's SQLAlchemyJobStore needs a sync psycopg2 URL
-        'default': SQLAlchemyJobStore(url=DATABASE_URL)
+        'default': SQLAlchemyJobStore(url=_SYNC_DB_URL)
     }
     executors = {
         'default': AsyncIOExecutor()

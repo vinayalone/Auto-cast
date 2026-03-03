@@ -7,6 +7,7 @@ import pytz
 import asyncpg
 import json
 from pyrogram import Client, filters, idle, errors, enums
+from pyrogram.raw.types import InputPeerChannel
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.date import DateTrigger
@@ -131,9 +132,10 @@ async def init_db():
         """)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS userbot_channels (
-                user_id    BIGINT,
-                channel_id TEXT,
-                title      TEXT,
+                user_id     BIGINT,
+                channel_id  TEXT,
+                title       TEXT,
+                access_hash BIGINT DEFAULT 0,
                 PRIMARY KEY (user_id, channel_id)
             );
         """)
@@ -166,6 +168,7 @@ async def init_db():
             "ALTER TABLE userbot_tasks_v11 ADD COLUMN IF NOT EXISTS auto_delete_offset INTEGER DEFAULT 0",
             "ALTER TABLE userbot_tasks_v11 ADD COLUMN IF NOT EXISTS reply_target TEXT",
             "ALTER TABLE userbot_settings  ADD COLUMN IF NOT EXISTS timezone TEXT DEFAULT 'UTC'",
+            "ALTER TABLE userbot_channels  ADD COLUMN IF NOT EXISTS access_hash BIGINT DEFAULT 0",
         ]:
             try:
                 await conn.execute(sql)
@@ -215,13 +218,21 @@ async def save_session(user_id, session):
         ON CONFLICT (user_id) DO UPDATE SET session_string=$2
     """, user_id, session)
 
-async def add_channel(user_id, cid, title):
+async def add_channel(user_id, cid, title, access_hash: int = 0):
     pool = await get_db()
     await pool.execute("""
-        INSERT INTO userbot_channels (user_id, channel_id, title)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (user_id, channel_id) DO UPDATE SET title=$3
-    """, user_id, cid, title)
+        INSERT INTO userbot_channels (user_id, channel_id, title, access_hash)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (user_id, channel_id) DO UPDATE SET title=$3, access_hash=$4
+    """, user_id, cid, title, access_hash)
+
+async def get_channel_access_hash(user_id, channel_id: str) -> int:
+    pool = await get_db()
+    row = await pool.fetchrow(
+        "SELECT access_hash FROM userbot_channels WHERE user_id=$1 AND channel_id=$2",
+        user_id, channel_id
+    )
+    return row["access_hash"] if row and row["access_hash"] else 0
 
 async def get_channels(user_id):
     pool = await get_db()
@@ -347,12 +358,15 @@ async def delete_sent_message(owner_id, chat_id, message_id):
         session = await get_session(owner_id)
         if not session:
             return
+        access_hash = await get_channel_access_hash(owner_id, str(chat_id))
+        raw_id = int(str(abs(int(chat_id)))[3:])
+        peer   = InputPeerChannel(channel_id=raw_id, access_hash=access_hash)
         async with Client(
             ":memory:", api_id=API_ID, api_hash=API_HASH,
             session_string=session,
             device_model="AutoCast", system_version="Railway", app_version="2.0"
         ) as user:
-            await user.delete_messages(int(chat_id), message_id)
+            await user.delete_messages(peer, message_id)
             logger.info(f"🗑 Auto-deleted msg {message_id} in {chat_id}")
     except errors.MessageDeleteForbidden:
         logger.warning(f"Auto-delete forbidden in {chat_id}")
@@ -1224,7 +1238,7 @@ async def handle_forward_add(c, m, uid):
     if not session:
         await m.reply("❌ Session expired. Please /start and login again.")
         return
-    # FIX B3: verify using USER's session, not bot's membership
+    access_hash = 0
     try:
         async with Client(
             ":memory:", api_id=API_ID, api_hash=API_HASH,
@@ -1233,10 +1247,16 @@ async def handle_forward_add(c, m, uid):
         ) as user_client:
             chat = await user_client.get_chat(cid)
             title = chat.title or title
+            # Capture access_hash while we have a live session that resolved the peer
+            try:
+                peer = await user_client.resolve_peer(cid)
+                access_hash = peer.access_hash
+            except Exception:
+                pass
     except Exception as e:
         logger.warning(f"Could not fetch channel info for {cid}: {e}")
 
-    await add_channel(uid, str(cid), title)
+    await add_channel(uid, str(cid), title, access_hash)
     user_state[uid]["step"] = None
     await m.reply(
         f"✅ **Channel Added!**\n\n**{title}** (`{cid}`)",
@@ -1284,11 +1304,18 @@ async def handle_channel_id_input(c, m, uid, text):
                 return
 
             title = chat.title or str(channel_id)
+            # Capture access_hash while we have a live session that resolved the peer
+            access_hash = 0
+            try:
+                peer = await user_client.resolve_peer(channel_id)
+                access_hash = peer.access_hash
+            except Exception:
+                pass
     except Exception as e:
         await m.reply(f"❌ Error connecting your account: {e}")
         return
 
-    await add_channel(uid, str(channel_id), title)
+    await add_channel(uid, str(channel_id), title, access_hash)
     user_state[uid]["step"] = None
     await m.reply(
         f"✅ **Channel Added!**\n\n**{title}** (`{channel_id}`)",
@@ -1497,24 +1524,37 @@ def add_scheduler_job(t):
                     # Delete previous message if requested
                     if fresh["delete_old"] and fresh.get("last_msg_id"):
                         try:
-                            await user.delete_messages(int(fresh["chat_id"]), fresh["last_msg_id"])
+                            del_ah = await get_channel_access_hash(
+                                fresh["owner_id"], fresh["chat_id"]
+                            )
+                            del_raw_id = int(str(abs(int(fresh["chat_id"])))[3:])
+                            del_peer = InputPeerChannel(
+                                channel_id=del_raw_id, access_hash=del_ah
+                            )
+                            await user.delete_messages(del_peer, fresh["last_msg_id"])
                             logger.info(f"Job {tid}: deleted old msg {fresh['last_msg_id']}")
                         except (errors.MessageDeleteForbidden, errors.MessageIdInvalid):
                             pass
                         except Exception as e:
                             logger.warning(f"Job {tid}: delete old failed: {e}")
 
-                    target   = int(fresh["chat_id"])
-                    caption  = fresh["content_text"]
-                    ents     = deserialize_entities(fresh["entities"])
-                    reply_id = None
+                    target_int = int(fresh["chat_id"])
+                    caption    = fresh["content_text"]
+                    ents       = deserialize_entities(fresh["entities"])
+                    reply_id   = None
 
-                    # ── Resolve peer: :memory: clients have no cache,
-                    #    get_chat() forces Pyrogram to fetch & cache the peer ──
-                    try:
-                        await user.get_chat(target)
-                    except Exception as peer_err:
-                        logger.warning(f"Job {tid}: peer resolve warning: {peer_err}")
+                    # ── Build peer directly using stored access_hash.
+                    #    :memory: clients have no peer cache so resolve_peer
+                    #    fails on every call. InputPeerChannel bypasses it. ──
+                    access_hash = await get_channel_access_hash(
+                        fresh["owner_id"], fresh["chat_id"]
+                    )
+                    # Strip the -100 prefix to get raw Telegram channel_id
+                    raw_channel_id = int(str(abs(target_int))[3:])
+                    target = InputPeerChannel(
+                        channel_id=raw_channel_id,
+                        access_hash=access_hash
+                    )
 
                     if fresh.get("reply_target"):
                         ref = await get_single_task(fresh["reply_target"])

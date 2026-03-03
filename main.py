@@ -7,7 +7,6 @@ import pytz
 import asyncpg
 import json
 from pyrogram import Client, filters, idle, errors, enums
-from pyrogram.raw.types import InputPeerChannel
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.date import DateTrigger
@@ -234,6 +233,25 @@ async def get_channel_access_hash(user_id, channel_id: str) -> int:
     )
     return row["access_hash"] if row and row["access_hash"] else 0
 
+def inject_peer(storage, peer_id: int, access_hash: int):
+    """
+    Write a channel peer directly into the client's in-memory SQLite cache.
+    Pyrogram's :memory: clients start with an empty peer table, so resolve_peer
+    always fails. Inserting the row ourselves makes every subsequent high-level
+    API call (send_message, delete_messages, etc.) work normally with the plain
+    integer chat_id — no raw API or InputPeerChannel required.
+    """
+    try:
+        storage.conn.execute(
+            "INSERT OR REPLACE INTO peers "
+            "(id, access_hash, type, username, phone_number) "
+            "VALUES (?, ?, 'channel', NULL, NULL)",
+            (peer_id, access_hash)
+        )
+        storage.conn.commit()
+    except Exception as e:
+        logger.warning(f"inject_peer failed (peer={peer_id}): {e}")
+
 async def get_channels(user_id):
     pool = await get_db()
     return await pool.fetch(
@@ -359,14 +377,14 @@ async def delete_sent_message(owner_id, chat_id, message_id):
         if not session:
             return
         access_hash = await get_channel_access_hash(owner_id, str(chat_id))
-        raw_id = int(str(abs(int(chat_id)))[3:])
-        peer   = InputPeerChannel(channel_id=raw_id, access_hash=access_hash)
+        chat_id_int = int(chat_id)
         async with Client(
             ":memory:", api_id=API_ID, api_hash=API_HASH,
             session_string=session,
             device_model="AutoCast", system_version="Railway", app_version="2.0"
         ) as user:
-            await user.delete_messages(peer, message_id)
+            inject_peer(user.storage, chat_id_int, access_hash)
+            await user.delete_messages(chat_id_int, message_id)
             logger.info(f"🗑 Auto-deleted msg {message_id} in {chat_id}")
     except errors.MessageDeleteForbidden:
         logger.warning(f"Auto-delete forbidden in {chat_id}")
@@ -1521,40 +1539,29 @@ def add_scheduler_job(t):
                     session_string=session,
                     device_model="AutoCast", system_version="Railway", app_version="2.0"
                 ) as user:
+
+                    target_int  = int(fresh["chat_id"])
+                    access_hash = await get_channel_access_hash(
+                        fresh["owner_id"], fresh["chat_id"]
+                    )
+                    # Inject peer into this client's in-memory SQLite cache so that
+                    # resolve_peer(target_int) works. Without this every high-level
+                    # method fails with "Peer id invalid" on :memory: clients.
+                    inject_peer(user.storage, target_int, access_hash)
+
+                    caption  = fresh["content_text"]
+                    ents     = deserialize_entities(fresh["entities"])
+                    reply_id = None
+
                     # Delete previous message if requested
                     if fresh["delete_old"] and fresh.get("last_msg_id"):
                         try:
-                            del_ah = await get_channel_access_hash(
-                                fresh["owner_id"], fresh["chat_id"]
-                            )
-                            del_raw_id = int(str(abs(int(fresh["chat_id"])))[3:])
-                            del_peer = InputPeerChannel(
-                                channel_id=del_raw_id, access_hash=del_ah
-                            )
-                            await user.delete_messages(del_peer, fresh["last_msg_id"])
+                            await user.delete_messages(target_int, fresh["last_msg_id"])
                             logger.info(f"Job {tid}: deleted old msg {fresh['last_msg_id']}")
                         except (errors.MessageDeleteForbidden, errors.MessageIdInvalid):
                             pass
                         except Exception as e:
                             logger.warning(f"Job {tid}: delete old failed: {e}")
-
-                    target_int = int(fresh["chat_id"])
-                    caption    = fresh["content_text"]
-                    ents       = deserialize_entities(fresh["entities"])
-                    reply_id   = None
-
-                    # ── Build peer directly using stored access_hash.
-                    #    :memory: clients have no peer cache so resolve_peer
-                    #    fails on every call. InputPeerChannel bypasses it. ──
-                    access_hash = await get_channel_access_hash(
-                        fresh["owner_id"], fresh["chat_id"]
-                    )
-                    # Strip the -100 prefix to get raw Telegram channel_id
-                    raw_channel_id = int(str(abs(target_int))[3:])
-                    target = InputPeerChannel(
-                        channel_id=raw_channel_id,
-                        access_hash=access_hash
-                    )
 
                     if fresh.get("reply_target"):
                         ref = await get_single_task(fresh["reply_target"])
@@ -1568,47 +1575,47 @@ def add_scheduler_job(t):
                         nonlocal sent
                         if ct == "text":
                             sent = await user.send_message(
-                                target, caption, entities=ents,
+                                target_int, caption, entities=ents,
                                 reply_to_message_id=reply_id
                             )
                         elif ct == "poll":
                             pd = json.loads(caption)
                             sent = await user.send_poll(
-                                target, pd["question"], pd["options"],
+                                target_int, pd["question"], pd["options"],
                                 reply_to_message_id=reply_id
                             )
                         elif ct == "photo":
                             sent = await user.send_photo(
-                                target, fid, caption=caption,
+                                target_int, fid, caption=caption,
                                 caption_entities=ents, reply_to_message_id=reply_id
                             )
                         elif ct == "video":
                             sent = await user.send_video(
-                                target, fid, caption=caption,
+                                target_int, fid, caption=caption,
                                 caption_entities=ents, reply_to_message_id=reply_id
                             )
                         elif ct == "animation":
                             sent = await user.send_animation(
-                                target, fid, caption=caption,
+                                target_int, fid, caption=caption,
                                 caption_entities=ents, reply_to_message_id=reply_id
                             )
                         elif ct == "document":
                             sent = await user.send_document(
-                                target, fid, caption=caption,
+                                target_int, fid, caption=caption,
                                 caption_entities=ents, reply_to_message_id=reply_id
                             )
                         elif ct == "sticker":
                             sent = await user.send_sticker(
-                                target, fid, reply_to_message_id=reply_id
+                                target_int, fid, reply_to_message_id=reply_id
                             )
                         elif ct == "audio":
                             sent = await user.send_audio(
-                                target, fid, caption=caption,
+                                target_int, fid, caption=caption,
                                 caption_entities=ents, reply_to_message_id=reply_id
                             )
                         elif ct == "voice":
                             sent = await user.send_voice(
-                                target, fid, caption=caption,
+                                target_int, fid, caption=caption,
                                 reply_to_message_id=reply_id
                             )
 
@@ -1618,19 +1625,19 @@ def add_scheduler_job(t):
                         logger.warning(f"Job {tid}: FileIdInvalid, attempting re-upload")
                         media = await app.download_media(fid, in_memory=True)
                         if ct == "photo":
-                            sent = await user.send_photo(target, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id)
+                            sent = await user.send_photo(target_int, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id)
                         elif ct == "video":
-                            sent = await user.send_video(target, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id)
+                            sent = await user.send_video(target_int, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id)
                         elif ct == "animation":
-                            sent = await user.send_animation(target, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id)
+                            sent = await user.send_animation(target_int, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id)
                         elif ct == "document":
-                            sent = await user.send_document(target, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id)
+                            sent = await user.send_document(target_int, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id)
                         elif ct == "audio":
                             media.name = "audio.mp3"
-                            sent = await user.send_audio(target, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id)
+                            sent = await user.send_audio(target_int, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id)
                         elif ct == "voice":
                             media.name = "voice.ogg"
-                            sent = await user.send_voice(target, media, caption=caption, reply_to_message_id=reply_id)
+                            sent = await user.send_voice(target_int, media, caption=caption, reply_to_message_id=reply_id)
                         elif ct == "sticker":
                             logger.error(f"Job {tid}: sticker re-upload not supported")
                             sent = None

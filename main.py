@@ -233,13 +233,48 @@ async def get_channel_access_hash(user_id, channel_id: str) -> int:
     )
     return row["access_hash"] if row and row["access_hash"] else 0
 
+async def warm_peer_and_get_hash(user_client, owner_id: int, channel_id: int) -> int:
+    """
+    Iterate the user's dialogs using Pyrogram's high-level get_dialogs().
+    Pyrogram automatically caches every peer it sees in each page of results.
+    Once the target channel appears, resolve_peer() will work and we extract
+    the correct user-account-specific access_hash and save it to the DB.
+
+    This is the only reliable approach for :memory: clients because:
+    - The session_string restores auth credentials only — no peer cache.
+    - access_hash is per-account: the bot's hash is useless for the userbot.
+    - channels.GetChannels with hash=0 is rejected by Telegram.
+    - get_dialogs() works without any pre-cached peer (uses InputPeerEmpty first).
+    """
+    try:
+        # Pyrogram's get_dialogs paginates automatically and caches all peers
+        async for dialog in user_client.get_dialogs():
+            if dialog.chat.id == channel_id:
+                try:
+                    peer = await user_client.storage.get_peer_by_id(channel_id)
+                    ah = getattr(peer, "access_hash", 0) or 0
+                    if ah:
+                        pool = await get_db()
+                        await pool.execute(
+                            "UPDATE userbot_channels SET access_hash=$1 "
+                            "WHERE user_id=$2 AND channel_id=$3",
+                            ah, owner_id, str(channel_id)
+                        )
+                        logger.info(f"✅ Cached access_hash for {channel_id} owner={owner_id}")
+                    return ah
+                except Exception as e:
+                    logger.warning(f"warm_peer resolve failed for {channel_id}: {e}")
+                    return 0
+    except Exception as e:
+        logger.warning(f"warm_peer get_dialogs failed for {channel_id}: {e}")
+    return 0
+
 def inject_peer(storage, peer_id: int, access_hash: int):
     """
     Write a channel peer directly into the client's in-memory SQLite cache.
     Pyrogram's :memory: clients start with an empty peer table, so resolve_peer
     always fails. Inserting the row ourselves makes every subsequent high-level
-    API call (send_message, delete_messages, etc.) work normally with the plain
-    integer chat_id — no raw API or InputPeerChannel required.
+    API call work normally with the plain integer chat_id.
     """
     try:
         storage.conn.execute(
@@ -1256,6 +1291,7 @@ async def handle_forward_add(c, m, uid):
     if not session:
         await m.reply("❌ Session expired. Please /start and login again.")
         return
+
     access_hash = 0
     try:
         async with Client(
@@ -1263,21 +1299,25 @@ async def handle_forward_add(c, m, uid):
             session_string=session,
             device_model="AutoCast", system_version="Railway", app_version="2.0"
         ) as user_client:
-            chat = await user_client.get_chat(cid)
-            title = chat.title or title
-            # Capture access_hash while we have a live session that resolved the peer
+            # warm_peer iterates the user's own dialogs — this gives us the
+            # user-account-specific access_hash, which is the only one that works
+            access_hash = await warm_peer_and_get_hash(user_client, uid, cid)
+            # Also try to get a better title if dialogs returned the chat
             try:
-                peer = await user_client.resolve_peer(cid)
-                access_hash = peer.access_hash
+                peer = await user_client.storage.get_peer_by_id(cid)
+                # peer found — get_chat will work now (peer is cached)
+                chat = await user_client.get_chat(cid)
+                title = chat.title or title
             except Exception:
                 pass
     except Exception as e:
-        logger.warning(f"Could not fetch channel info for {cid}: {e}")
+        logger.warning(f"handle_forward_add session error for {cid}: {e}")
 
     await add_channel(uid, str(cid), title, access_hash)
     user_state[uid]["step"] = None
     await m.reply(
-        f"✅ **Channel Added!**\n\n**{title}** (`{cid}`)",
+        f"✅ **Channel Added!**\n\n**{title}** (`{cid}`)\n\n"
+        + ("" if access_hash else "⚠️ Could not cache peer — re-add if posting fails."),
         reply_markup=ReplyKeyboardRemove()
     )
     await start_cmd(c, m)
@@ -1298,37 +1338,31 @@ async def handle_channel_id_input(c, m, uid, text):
         await m.reply("❌ Session expired. Please /start and login again.")
         return
 
-    # FIX B3: use USER's session to look up the channel — no bot admin check
+    title       = str(channel_id)
+    access_hash = 0
     try:
         async with Client(
             ":memory:", api_id=API_ID, api_hash=API_HASH,
             session_string=session,
             device_model="AutoCast", system_version="Railway", app_version="2.0"
         ) as user_client:
-            try:
-                chat = await user_client.get_chat(channel_id)
-            except errors.PeerIdInvalid:
+            # Warm peer cache by iterating dialogs — gives user-specific access_hash
+            access_hash = await warm_peer_and_get_hash(user_client, uid, channel_id)
+            if not access_hash:
                 await m.reply(
-                    "❌ Channel not found. Make sure you are a member/admin of the channel "
-                    "and the ID is correct."
+                    "❌ Channel not found in your dialogs.\n\n"
+                    "Make sure you are a **member or admin** of this channel and try again."
                 )
                 return
-            except Exception as e:
-                await m.reply(f"❌ Could not access channel: {e}")
-                return
-
-            if chat.type not in (enums.ChatType.CHANNEL, enums.ChatType.SUPERGROUP):
-                await m.reply("❌ That ID doesn't belong to a channel.")
-                return
-
-            title = chat.title or str(channel_id)
-            # Capture access_hash while we have a live session that resolved the peer
-            access_hash = 0
+            # Now peer is cached — get_chat works
             try:
-                peer = await user_client.resolve_peer(channel_id)
-                access_hash = peer.access_hash
-            except Exception:
-                pass
+                chat = await user_client.get_chat(channel_id)
+                if chat.type not in (enums.ChatType.CHANNEL, enums.ChatType.SUPERGROUP):
+                    await m.reply("❌ That ID doesn't belong to a channel.")
+                    return
+                title = chat.title or title
+            except Exception as e:
+                logger.warning(f"get_chat after warm failed for {channel_id}: {e}")
     except Exception as e:
         await m.reply(f"❌ Error connecting your account: {e}")
         return
@@ -1541,12 +1575,25 @@ def add_scheduler_job(t):
                 ) as user:
 
                     target_int  = int(fresh["chat_id"])
+
+                    # Get access_hash — fetch from dialogs if not in DB (handles
+                    # channels added before access_hash was stored, and refreshes
+                    # stale values).
                     access_hash = await get_channel_access_hash(
                         fresh["owner_id"], fresh["chat_id"]
                     )
-                    # Inject peer into this client's in-memory SQLite cache so that
-                    # resolve_peer(target_int) works. Without this every high-level
-                    # method fails with "Peer id invalid" on :memory: clients.
+                    if not access_hash:
+                        logger.info(f"Job {tid}: access_hash missing, scanning dialogs…")
+                        access_hash = await warm_peer_and_get_hash(
+                            user, fresh["owner_id"], target_int
+                        )
+                        if not access_hash:
+                            logger.error(
+                                f"Job {tid}: cannot resolve channel {fresh['chat_id']} — "
+                                "user must re-add it so access_hash can be cached"
+                            )
+                            return
+
                     inject_peer(user.storage, target_int, access_hash)
 
                     caption  = fresh["content_text"]

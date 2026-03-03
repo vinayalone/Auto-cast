@@ -551,6 +551,11 @@ async def show_channel_options(uid, m, cid, force_new=False):
     await update_menu(m, "⚙️ **Managing Channel**", kb, uid, force_new)
 
 async def show_time_menu(m, uid, force_new=False):
+    st = user_state.get(uid, {})
+    editing_tid = st.get("editing_task_id")
+    # If we're rescheduling, "Back" should return to task details, not home
+    back_target = f"view_{editing_tid}" if editing_tid else "menu_home"
+
     kb = [
         [InlineKeyboardButton("⚡️ Now (5s delay)",   callback_data="time_0")],
         [InlineKeyboardButton("5 Minutes",            callback_data="time_5"),
@@ -558,7 +563,7 @@ async def show_time_menu(m, uid, force_new=False):
         [InlineKeyboardButton("30 Minutes",           callback_data="time_30"),
          InlineKeyboardButton("1 Hour",               callback_data="time_60")],
         [InlineKeyboardButton("📅 Custom Date/Time",  callback_data="time_custom")],
-        [InlineKeyboardButton("🔙 Back",              callback_data="menu_home")],
+        [InlineKeyboardButton("🔙 Back",              callback_data=back_target)],
     ]
     tz = await get_user_tz(uid)
     await update_menu(

@@ -232,6 +232,18 @@ async def get_channel_access_hash(user_id, channel_id: str) -> int:
     return row["access_hash"] if row and row["access_hash"] else 0
 
 async def warm_peer_and_get_hash(user_client, owner_id: int, channel_id: int) -> int:
+    """
+    Iterate the user's dialogs using Pyrogram's high-level get_dialogs().
+    Pyrogram automatically caches every peer it sees in each page of results.
+    Once the target channel appears, resolve_peer() will work and we extract
+    the correct user-account-specific access_hash and save it to the DB.
+
+    This is the only reliable approach for :memory: clients because:
+    - The session_string restores auth credentials only — no peer cache.
+    - access_hash is per-account: the bot's hash is useless for the userbot.
+    - channels.GetChannels with hash=0 is rejected by Telegram.
+    - get_dialogs() works without any pre-cached peer (uses InputPeerEmpty first).
+    """
     try:
         async for dialog in user_client.get_dialogs():
             if dialog.chat.id == channel_id:
@@ -255,6 +267,12 @@ async def warm_peer_and_get_hash(user_client, owner_id: int, channel_id: int) ->
     return 0
 
 def inject_peer(storage, peer_id: int, access_hash: int):
+    """
+    Write a channel peer directly into the client's in-memory SQLite cache.
+    Pyrogram's :memory: clients start with an empty peer table, so resolve_peer
+    always fails. Inserting the row ourselves makes every subsequent high-level
+    API call work normally with the plain integer chat_id.
+    """
     try:
         storage.conn.execute(
             "INSERT OR REPLACE INTO peers "
@@ -553,6 +571,8 @@ async def ask_repetition(m, uid, force_new=False):
         [InlineKeyboardButton("Every 6 Hours",        callback_data="rep_360"),
          InlineKeyboardButton("Every 12 Hours",       callback_data="rep_720")],
         [InlineKeyboardButton("Every 24 Hours",       callback_data="rep_1440")],
+        [InlineKeyboardButton("Every 2 Days",         callback_data="rep_2880"),
+         InlineKeyboardButton("Every 1 Week",         callback_data="rep_10080")],
         [InlineKeyboardButton("🔙 Back",              callback_data="step_time")],
     ]
     await update_menu(m, "3️⃣ **Repetition**\n\nHow often should this post repeat?", kb, uid, force_new)
@@ -697,6 +717,7 @@ async def show_task_details(uid, m, tid):
     txt = (
         f"⚙️ **Task Details**\n\n"
         f"📂 **Type:** {type_str}\n"
+        f"📝 **Content:** `{(t['content_text'] or 'Media')[:60]}…`\n"
         f"📅 **Scheduled:** `{time_str}`\n"
         f"🔁 **Repeat:** `{t['repeat_interval'] or 'Once'}`\n"
         f"📌 **Pin:** {'✅' if t['pin'] else '❌'} | "
@@ -835,10 +856,12 @@ async def callback_router(c, q):
             pass
 
 async def _handle_callback(c, q, uid, d):
+    # ── HOME ──────────────────────────────────────────────────────────────────
     if d == "menu_home":
         user_state[uid]["step"] = None
         await show_main_menu(q.message, uid)
 
+    # ── TIMEZONE ─────────────────────────────────────────────────────────────
     elif d == "tz_select":
         await show_tz_selector(uid, q.message)
 
@@ -852,6 +875,7 @@ async def _handle_callback(c, q, uid, d):
             await q.answer("❌ Invalid timezone.", show_alert=True)
         await show_main_menu(q.message, uid)
 
+    # ── LOGIN ─────────────────────────────────────────────────────────────────
     elif d == "login_start":
         login_state[uid] = {"step": "waiting_phone"}
         await update_menu(
@@ -863,6 +887,7 @@ async def _handle_callback(c, q, uid, d):
             uid
         )
 
+    # ── LOGOUT ────────────────────────────────────────────────────────────────
     elif d == "logout":
         pool = await get_db()
         count = await pool.fetchval(
@@ -912,6 +937,7 @@ async def _handle_callback(c, q, uid, d):
         except Exception:
             pass
 
+    # ── TASK VIEW / DELETE ────────────────────────────────────────────────────
     elif d.startswith("view_"):
         await show_task_details(uid, q.message, d[5:])
 
@@ -1077,8 +1103,8 @@ async def _handle_callback(c, q, uid, d):
             [InlineKeyboardButton("Every 6 Hours",        callback_data="rep_360"),
              InlineKeyboardButton("Every 12 Hours",       callback_data="rep_720")],
             [InlineKeyboardButton("Every 24 Hours",       callback_data="rep_1440")],
-             InlineKeyboardButton("Every 2 Days",       callback_data="rep_2880")],
-            [InlineKeyboardButton("Every 1 Week",       callback_data="rep_10080")],
+            [InlineKeyboardButton("Every 2 Days",         callback_data="rep_2880"),
+             InlineKeyboardButton("Every 1 Week",         callback_data="rep_10080")],
             [InlineKeyboardButton("🔙 Back",              callback_data=f"view_{tid}")],
         ]
         await update_menu(

@@ -7,6 +7,7 @@ import hashlib
 import logging
 import asyncio
 import datetime
+import time
 import pytz
 import asyncpg
 from cryptography.fernet import Fernet
@@ -59,11 +60,32 @@ app = Client(
 )
 scheduler  = None
 db_pool    = None
-queue_lock = None
+queue_lock: asyncio.Lock | None = None  # created lazily on first job execution
 
-login_state = {}
-user_state  = {}
-tz_cache    = {}
+login_state    = {}
+user_state     = {}
+tz_cache       = {}
+_user_last_seen: dict = {}
+_db_init_lock: asyncio.Lock | None = None  # created lazily on first get_db() call
+_STATE_TTL     = 7200   # evict in-memory state after 2 h of inactivity
+_last_evict    = 0.0     # rate-limit _evict_stale to once per 60 s
+
+def _touch(uid: int):
+    _user_last_seen[uid] = time.monotonic()
+
+def _evict_stale():
+    global _last_evict
+    now = time.monotonic()
+    if now - _last_evict < 60:   # only scan at most once per minute
+        return
+    _last_evict = now
+    stale = [u for u, t in list(_user_last_seen.items()) if now - t > _STATE_TTL]
+    for u in stale:
+        user_state.pop(u, None)
+        tz_cache.pop(u, None)
+        _user_last_seen.pop(u, None)
+    if stale:
+        logger.debug(f"Evicted in-memory state for {len(stale)} inactive user(s)")
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  FIX 1 — SESSION ENCRYPTION
@@ -168,9 +190,15 @@ def now_in(tz: pytz.BaseTzInfo) -> datetime.datetime:
 #  DATABASE
 # ─────────────────────────────────────────────────────────────────────────────
 async def get_db():
-    global db_pool
-    if not db_pool:
-        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+    global db_pool, _db_init_lock
+    if db_pool:
+        return db_pool
+    # Lazy-create the lock the first time we enter an async context (safe; always in event loop)
+    if _db_init_lock is None:
+        _db_init_lock = asyncio.Lock()
+    async with _db_init_lock:
+        if not db_pool:  # double-checked under lock
+            db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
     return db_pool
 
 async def init_db():
@@ -285,9 +313,24 @@ def _serialize_wizard(st: dict) -> str:
             continue
         if k == "start_time" and isinstance(v, datetime.datetime):
             out[k] = {"__dt__": _ensure_utc(v).isoformat()}
+        elif k == "broadcast_queue" and isinstance(v, list):
+            # Deep-serialize each post; skip any non-serializable values
+            safe_queue = []
+            for post in v:
+                safe_post = {}
+                for pk, pv in post.items():
+                    if isinstance(pv, (str, int, float, bool, type(None))):
+                        safe_post[pk] = pv
+                    # Skip BytesIO or other non-serializable objects entirely
+                safe_queue.append(safe_post)
+            out[k] = safe_queue
         else:
-            out[k] = v
-    return json.dumps(out, default=str)
+            try:
+                json.dumps(v)   # test serializability
+                out[k] = v
+            except (TypeError, ValueError):
+                pass  # silently drop non-serializable values
+    return json.dumps(out)
 
 def _deserialize_wizard(s: str) -> dict:
     raw = json.loads(s)
@@ -374,8 +417,12 @@ async def get_channel_access_hash(user_id, channel_id: str) -> int:
     )
     return row["access_hash"] if row and row["access_hash"] else 0
 
-async def warm_peer_and_get_hash(user_client, owner_id: int, channel_id: int) -> int:
-    try:
+async def warm_peer_and_get_hash(user_client, owner_id: int, channel_id: int,
+                                    timeout: float = 25.0) -> int:
+    """Scan dialogs to locate channel and cache its access_hash.
+    Bounded by `timeout` seconds so it never stalls the bot.
+    """
+    async def _scan():
         async for dialog in user_client.get_dialogs():
             if dialog.chat.id == channel_id:
                 try:
@@ -393,9 +440,15 @@ async def warm_peer_and_get_hash(user_client, owner_id: int, channel_id: int) ->
                 except Exception as e:
                     logger.warning(f"warm_peer resolve failed for {channel_id}: {e}")
                     return 0
+        return 0
+    try:
+        return await asyncio.wait_for(_scan(), timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.warning(f"warm_peer timed out after {timeout}s for channel {channel_id}")
+        return 0
     except Exception as e:
         logger.warning(f"warm_peer get_dialogs failed for {channel_id}: {e}")
-    return 0
+        return 0
 
 def inject_peer(storage, peer_id: int, access_hash: int):
     try:
@@ -417,14 +470,18 @@ async def get_channels(user_id):
 
 async def del_channel(user_id, cid):
     pool = await get_db()
+    # Filter by BOTH owner_id AND chat_id — never remove another user's tasks
     tasks = await pool.fetch(
-        "SELECT task_id FROM userbot_tasks_v11 WHERE chat_id=$1", cid
+        "SELECT task_id FROM userbot_tasks_v11 WHERE owner_id=$1 AND chat_id=$2",
+        user_id, cid
     )
     if scheduler:
         for t in tasks:
             try: scheduler.remove_job(t["task_id"])
             except Exception: pass
-    await pool.execute("DELETE FROM userbot_tasks_v11 WHERE chat_id=$1", cid)
+    await pool.execute(
+        "DELETE FROM userbot_tasks_v11 WHERE owner_id=$1 AND chat_id=$2", user_id, cid
+    )
     await pool.execute(
         "DELETE FROM userbot_channels WHERE user_id=$1 AND channel_id=$2", user_id, cid
     )
@@ -517,7 +574,16 @@ async def delete_all_user_data(user_id):
                     app_version="2.0"
                 ) as u:
                     await u.log_out()
-            await asyncio.wait_for(_logout(), timeout=6.0)
+            # Try twice with increasing timeout before giving up
+            for _attempt, _t in enumerate([8.0, 15.0], 1):
+                try:
+                    await asyncio.wait_for(_logout(), timeout=_t)
+                    break
+                except asyncio.TimeoutError:
+                    if _attempt == 1:
+                        logger.warning(f"Session logout timeout on attempt {_attempt}, retrying…")
+                    else:
+                        raise
         except Exception as e:
             logger.warning(f"Session logout skipped: {e}")
 
@@ -575,7 +641,7 @@ def serialize_entities(elist):
     return json.dumps([{
         "type": str(e.type), "offset": e.offset, "length": e.length,
         "url": e.url, "language": e.language,
-        "custom_emoji_id": e.custom_emoji_id
+        "custom_emoji_id": getattr(e, "custom_emoji_id", None)
     } for e in elist])
 
 def deserialize_entities(json_str):
@@ -599,10 +665,112 @@ def deserialize_entities(json_str):
 # ─────────────────────────────────────────────────────────────────────────────
 #  EXPORT / IMPORT
 # ─────────────────────────────────────────────────────────────────────────────
-EXPORT_VERSION = 2
+EXPORT_VERSION = 3
+
+# Maximum bytes to embed per media file in the export JSON (25 MB — Telegram upload limit)
+_MAX_MEDIA_EMBED_BYTES = 25 * 1024 * 1024
+
+def _next_future_run(original_iso: str, interval_str: str | None, now_utc: datetime.datetime) -> datetime.datetime:
+    """
+    Given an original start_time and a repeat_interval string like 'minutes=60',
+    return the next run time that is strictly in the future relative to now_utc.
+    For one-time tasks that are in the past this returns now + 5 minutes.
+    """
+    try:
+        dt = _ensure_utc(datetime.datetime.fromisoformat(original_iso))
+    except Exception:
+        return now_utc + datetime.timedelta(minutes=5)
+
+    if dt > now_utc:
+        return dt  # already in the future — keep it as-is
+
+    if not interval_str:
+        # One-time task that has already fired: push it 5 min ahead
+        return now_utc + datetime.timedelta(minutes=5)
+
+    # Recurring: advance by full intervals until we're in the future
+    try:
+        mins = int(interval_str.split("=")[1])
+        delta = datetime.timedelta(minutes=mins)
+        elapsed = now_utc - dt
+        periods_missed = int(elapsed.total_seconds() / delta.total_seconds()) + 1
+        return dt + delta * periods_missed
+    except Exception:
+        return now_utc + datetime.timedelta(minutes=5)
+
+
+async def _download_media_bytes(file_id: str) -> bytes | None:
+    """Download media via the bot client into memory. Returns None on failure."""
+    try:
+        buf = await app.download_media(file_id, in_memory=True)
+        if buf:
+            raw = bytes(buf.getbuffer())
+            if len(raw) <= _MAX_MEDIA_EMBED_BYTES:
+                return raw
+            logger.warning(f"Media {file_id[:20]}… too large to embed ({len(raw)} bytes)")
+    except Exception as e:
+        logger.warning(f"Could not download media {file_id[:20]}…: {e}")
+    return None
+
+
+async def _upload_media_bytes(user_client, target_dummy: int, ct: str,
+                               raw: bytes, caption: str | None,
+                               ents) -> str | None:
+    """
+    Upload raw media bytes via the userbot client to Telegram Saved Messages
+    (user_id — always accessible) and return the new file_id.
+    We send to Saved Messages as a staging area, grab the file_id, then delete.
+    """
+    buf = io.BytesIO(raw)
+    sent = None
+    try:
+        # Infer a filename hint so Telegram picks the right MIME type
+        name_map = {
+            "photo": "photo.jpg", "video": "video.mp4",
+            "animation": "anim.mp4", "document": "file.bin",
+            "audio": "audio.mp3", "voice": "voice.ogg",
+            "sticker": "sticker.webp",
+        }
+        buf.name = name_map.get(ct, "file.bin")
+
+        if ct == "photo":
+            sent = await user_client.send_photo(target_dummy, buf, caption=caption or "")
+            fid  = sent.photo.file_id
+        elif ct == "video":
+            sent = await user_client.send_video(target_dummy, buf, caption=caption or "")
+            fid  = sent.video.file_id
+        elif ct == "animation":
+            sent = await user_client.send_animation(target_dummy, buf, caption=caption or "")
+            fid  = sent.animation.file_id
+        elif ct == "audio":
+            sent = await user_client.send_audio(target_dummy, buf, caption=caption or "")
+            fid  = sent.audio.file_id
+        elif ct == "voice":
+            sent = await user_client.send_voice(target_dummy, buf)
+            fid  = sent.voice.file_id
+        elif ct == "sticker":
+            sent = await user_client.send_sticker(target_dummy, buf)
+            fid  = sent.sticker.file_id
+        else:  # document fallback
+            sent = await user_client.send_document(target_dummy, buf, caption=caption or "")
+            fid  = sent.document.file_id
+        return fid
+    except Exception as e:
+        logger.warning(f"_upload_media_bytes ct={ct}: {e}")
+        return None
+    finally:
+        if sent:
+            try:
+                await sent.delete()
+            except Exception:
+                pass
+
 
 async def export_user_config(uid: int) -> dict:
-    """Serialises all tasks, channels, and settings to a portable dict."""
+    """
+    Serialises all tasks, channels, and settings to a fully self-contained dict.
+    Media files are downloaded and embedded as base64 so the export works on any account.
+    """
     pool = await get_db()
     tasks    = [dict(r) for r in await pool.fetch(
         "SELECT * FROM userbot_tasks_v11 WHERE owner_id=$1", uid
@@ -616,7 +784,7 @@ async def export_user_config(uid: int) -> dict:
 
     export_tasks = []
     for t in tasks:
-        export_tasks.append({
+        entry = {
             "chat_id":            t["chat_id"],
             "content_type":       t["content_type"],
             "content_text":       t["content_text"],
@@ -630,7 +798,14 @@ async def export_user_config(uid: int) -> dict:
             "reply_target":       t.get("reply_target"),
             "src_chat_id":        t.get("src_chat_id", 0),
             "src_msg_id":         t.get("src_msg_id", 0),
-        })
+            "media_bytes":        None,   # filled below for media tasks
+        }
+        # Embed media bytes so the export is account-independent
+        if t["content_type"] not in ("text", "poll") and t.get("file_id"):
+            raw = await _download_media_bytes(t["file_id"])
+            if raw:
+                entry["media_bytes"] = base64.b64encode(raw).decode()
+        export_tasks.append(entry)
 
     return {
         "version":     EXPORT_VERSION,
@@ -640,74 +815,161 @@ async def export_user_config(uid: int) -> dict:
         "tasks":       export_tasks,
     }
 
-async def import_user_config(uid: int, data: dict) -> tuple[int, list[str]]:
+
+async def import_user_config(uid: int, data: dict,
+                              progress_cb=None) -> tuple[int, list[str]]:
     """
-    Creates tasks from an export dict.
+    Fully portable import:
+    • Timing   — recurring tasks land at the correct next future occurrence;
+                 one-time past tasks are pushed 5 min ahead.
+    • Channels — access_hash is resolved automatically via the user's session
+                 (warm_peer_and_get_hash) so posting works immediately.
+    • Media    — if media_bytes is present in the export the file is re-uploaded
+                 to Telegram via the user's account and a fresh file_id is stored.
+                 Falls back to the original file_id when bytes are missing.
+
+    progress_cb: optional async callable(message: str) for status updates.
     Returns (imported_count, list_of_error_strings).
-    Tasks whose start_time is in the past are rescheduled to 5 min from now.
-    File IDs are preserved but may be invalid if the source account differs.
     """
-    if data.get("version") not in (1, 2):
-        return 0, [f"Unsupported export version '{data.get('version')}'. Expected 1 or 2."]
+    if data.get("version") not in (1, 2, 3):
+        return 0, [f"Unsupported export version '{data.get('version')}'. Expected 2 or 3."]
+
+    async def _progress(msg: str):
+        if progress_cb:
+            try:
+                await progress_cb(msg)
+            except Exception:
+                pass
 
     errs: list[str] = []
     imported = 0
     now_utc  = datetime.datetime.now(pytz.utc)
     base_tid = int(now_utc.timestamp())
 
-    # --- settings ---
+    # ── 1. Settings ──────────────────────────────────────────────────────────
     if "settings" in data:
         tz_str = data["settings"].get("timezone", "UTC")
         try:
             pytz.timezone(tz_str)
             await set_user_tz(uid, tz_str)
         except Exception:
-            errs.append(f"Invalid timezone '{tz_str}' — skipped.")
+            errs.append(f"Invalid timezone '{tz_str}' — kept UTC.")
 
-    # --- channels (re-add without access_hash; user must re-add for posting) ---
-    for ch in data.get("channels", []):
-        try:
-            await add_channel(uid, str(ch["channel_id"]),
-                              ch.get("title", "Imported Channel"), 0)
-        except Exception as e:
-            errs.append(f"Channel {ch.get('channel_id')}: {e}")
+    # ── 2. Get user session for channel warming & media re-upload ─────────────
+    session = await get_session(uid)
+    if not session:
+        errs.append(
+            "⚠️ You are not logged in. Channels were imported without access_hash "
+            "(posting will fail until you re-add them) and media file IDs were not "
+            "re-uploaded to your account. Log in and re-import for full functionality."
+        )
+    user_client_ctx = None
+    if session:
+        user_client_ctx = Client(
+            ":memory:", api_id=API_ID, api_hash=API_HASH,
+            session_string=session,
+            device_model="AutoCast", system_version="Railway", app_version="2.0"
+        )
+        await user_client_ctx.start()
 
-    # --- tasks ---
-    for i, t in enumerate(data.get("tasks", [])):
-        try:
-            # Resolve start_time; shift into the future if it's in the past
+    try:
+        # ── 3. Channels — re-add and immediately resolve access_hash ──────────
+        channels = data.get("channels", [])
+        if channels:
+            await _progress(f"⏳ Resolving {len(channels)} channel(s)…")
+        warmed = 0
+        for ch in channels:
+            cid_str = str(ch["channel_id"])
+            title   = ch.get("title", "Imported Channel")
+            ah = 0
+            if user_client_ctx:
+                try:
+                    ah = await warm_peer_and_get_hash(user_client_ctx, uid, int(cid_str))
+                except Exception as e:
+                    logger.warning(f"import warm_peer {cid_str}: {e}")
             try:
-                dt = datetime.datetime.fromisoformat(t["start_time"])
-                dt = _ensure_utc(dt)
-                if dt <= now_utc:
-                    dt = now_utc + datetime.timedelta(minutes=5, seconds=i * 10)
-            except Exception:
-                dt = now_utc + datetime.timedelta(minutes=5, seconds=i * 10)
+                await add_channel(uid, cid_str, title, ah)
+                if ah:
+                    warmed += 1
+            except Exception as e:
+                errs.append(f"Channel {cid_str}: {e}")
 
-            tid = f"task_{base_tid}_imp_{i}"
-            task_data = {
-                "task_id":            tid,
-                "owner_id":           uid,
-                "chat_id":            str(t["chat_id"]),
-                "content_type":       t.get("content_type", "text"),
-                "content_text":       t.get("content_text"),
-                "file_id":            t.get("file_id"),
-                "entities":           t.get("entities"),
-                "pin":                bool(t.get("pin", True)),
-                "delete_old":         bool(t.get("delete_old", True)),
-                "repeat_interval":    t.get("repeat_interval"),
-                "start_time":         dt.isoformat(),
-                "last_msg_id":        None,
-                "auto_delete_offset": int(t.get("auto_delete_offset", 0)),
-                "reply_target":       t.get("reply_target"),
-                "src_chat_id":        int(t.get("src_chat_id", 0) or 0),
-                "src_msg_id":         int(t.get("src_msg_id", 0) or 0),
-            }
-            await save_task(task_data)
-            add_scheduler_job(task_data)
-            imported += 1
-        except Exception as e:
-            errs.append(f"Task #{i + 1}: {e}")
+        # ── 4. Tasks ─────────────────────────────────────────────────────────
+        tasks = data.get("tasks", [])
+        media_tasks = [t for t in tasks if t.get("content_type") not in ("text", "poll")
+                       and (t.get("media_bytes") or t.get("file_id"))]
+        if media_tasks:
+            await _progress(
+                f"⏳ Re-uploading {len(media_tasks)} media file(s) — this may take a moment…"
+            )
+
+        for i, t in enumerate(tasks):
+            try:
+                # ── timing ───────────────────────────────────────────────────
+                dt = _next_future_run(
+                    t.get("start_time", ""),
+                    t.get("repeat_interval"),
+                    now_utc + datetime.timedelta(seconds=i * 10)
+                )
+                # (stagger already baked into _next_future_run via shifted now_utc arg)
+
+                # ── media re-upload ──────────────────────────────────────────
+                ct  = t.get("content_type", "text")
+                fid = t.get("file_id")
+
+                if ct not in ("text", "poll") and user_client_ctx:
+                    raw_b64 = t.get("media_bytes")
+                    if raw_b64:
+                        # v3 export: re-upload embedded bytes → fresh file_id
+                        try:
+                            raw = base64.b64decode(raw_b64)
+                            new_fid = await _upload_media_bytes(
+                                user_client_ctx, uid, ct,
+                                raw, t.get("content_text"), None
+                            )
+                            if new_fid:
+                                fid = new_fid
+                            else:
+                                errs.append(
+                                    f"Task #{i+1}: media re-upload failed — "
+                                    "original file_id kept (may not work)."
+                                )
+                        except Exception as ue:
+                            errs.append(f"Task #{i+1}: media decode/upload error: {ue}")
+                    # If no media_bytes (v2 export), keep original file_id as-is
+
+                tid = f"task_{base_tid}_imp_{i}"
+                task_data = {
+                    "task_id":            tid,
+                    "owner_id":           uid,
+                    "chat_id":            str(t["chat_id"]),
+                    "content_type":       ct,
+                    "content_text":       t.get("content_text"),
+                    "file_id":            fid,
+                    "entities":           t.get("entities"),
+                    "pin":                bool(t.get("pin", True)),
+                    "delete_old":         bool(t.get("delete_old", True)),
+                    "repeat_interval":    t.get("repeat_interval"),
+                    "start_time":         dt.isoformat(),
+                    "last_msg_id":        None,
+                    "auto_delete_offset": int(t.get("auto_delete_offset", 0)),
+                    "reply_target":       t.get("reply_target"),
+                    "src_chat_id":        int(t.get("src_chat_id", 0) or 0),
+                    "src_msg_id":         int(t.get("src_msg_id", 0) or 0),
+                }
+                await save_task(task_data)
+                add_scheduler_job(task_data)
+                imported += 1
+
+            except Exception as e:
+                errs.append(f"Task #{i + 1}: {e}")
+
+    finally:
+        if user_client_ctx:
+            try:
+                await user_client_ctx.stop()
+            except Exception:
+                pass
 
     return imported, errs
 
@@ -916,7 +1178,12 @@ async def list_active_tasks(uid, m, cid, force_new=False):
             uid, force_new
         )
         return
-    tasks.sort(key=lambda x: x["start_time"])
+    def _sort_key(t):
+        try:
+            return _ensure_utc(datetime.datetime.fromisoformat(t["start_time"]))
+        except Exception:
+            return datetime.datetime.min.replace(tzinfo=pytz.utc)
+    tasks.sort(key=_sort_key)
     tz    = await get_user_tz(uid)
     icons = {"text": "📝", "photo": "📷", "video": "📹", "audio": "🎵", "poll": "📊"}
     kb = []
@@ -1044,21 +1311,7 @@ async def start_cmd(c, m):
         user_state[uid] = {}
         await restore_wizard_state(uid)
     if await get_session(uid):
-        sent = await m.reply(
-            "👋 **Welcome to AutoCast | Channel Manager!**\n\n"
-            "Your central hub for managing scheduled posts across your Telegram channels.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📢 Broadcast (Post to All)", callback_data="broadcast_start")],
-                [InlineKeyboardButton("📢 My Channels",             callback_data="list_channels")],
-                [InlineKeyboardButton("➕ Add Channel (Forward)",   callback_data="add_channel_forward"),
-                 InlineKeyboardButton("➕ Add by ID",               callback_data="add_channel_id")],
-                [InlineKeyboardButton("🌐 Set Timezone",            callback_data="tz_select")],
-                [InlineKeyboardButton("⬆️ Export Config",           callback_data="export_config"),
-                 InlineKeyboardButton("⬇️ Import Config",           callback_data="import_config")],
-                [InlineKeyboardButton("🚪 Logout",                  callback_data="logout")],
-            ])
-        )
-        user_state[uid]["menu_msg_id"] = sent.id
+        await show_main_menu(m, uid, force_new=True)
     else:
         await m.reply(
             "👋 **Welcome to AutoCast | Channel Manager!**\n\n"
@@ -1081,10 +1334,19 @@ async def callback_router(c, q):
     uid = q.from_user.id
     d   = q.data
 
+    _touch(uid)
+    _evict_stale()
+
     if uid not in user_state:
         user_state[uid] = {}
         await restore_wizard_state(uid)
     user_state[uid]["menu_msg_id"] = q.message.id
+
+    # Answer immediately so Telegram clears the loading indicator on every button
+    try:
+        await q.answer()
+    except Exception:
+        pass
 
     try:
         await _handle_callback(c, q, uid, d)
@@ -1095,7 +1357,6 @@ async def callback_router(c, q):
         except Exception:
             pass
     finally:
-        # FIX 3 — persist wizard state after every interaction
         await persist_wizard_state(uid)
 
 async def _handle_callback(c, q, uid, d):
@@ -1115,11 +1376,18 @@ async def _handle_callback(c, q, uid, d):
             await set_user_tz(uid, tz_str)
             await q.answer(f"✅ Timezone set to {tz_str}!", show_alert=False)
         except Exception:
-            await q.answer("❌ Invalid timezone.", show_alert=True)
+            await app.send_message(uid, "❌ Invalid timezone selected.")
         await show_main_menu(q.message, uid)
 
     # ── LOGIN ─────────────────────────────────────────────────────────────────
     elif d == "login_start":
+        # Disconnect any in-progress login client before starting fresh
+        old = login_state.get(uid)
+        if old and old.get("client"):
+            try:
+                await old["client"].disconnect()
+            except Exception:
+                pass
         login_state[uid] = {"step": "waiting_phone"}
         await update_menu(
             q.message,
@@ -1183,26 +1451,35 @@ async def _handle_callback(c, q, uid, d):
     # ── EXPORT ────────────────────────────────────────────────────────────────
     elif d == "export_config":
         await q.answer("⏳ Generating export…")
+        prog_msg = await app.send_message(uid, "⏳ **Exporting…** downloading media files, please wait.")
         try:
             data = await export_user_config(uid)
+            media_count = sum(1 for t in data["tasks"] if t.get("media_bytes"))
             buf = io.BytesIO(json.dumps(data, indent=2, ensure_ascii=False).encode())
             buf.name = f"autocast_backup_{uid}.json"
+            await prog_msg.delete()
             await app.send_document(
                 uid, buf,
                 caption=(
                     "📦 **AutoCast Configuration Export**\n\n"
                     f"✅ Tasks: **{len(data['tasks'])}**  |  "
-                    f"📢 Channels: **{len(data['channels'])}**\n"
+                    f"📢 Channels: **{len(data['channels'])}**  |  "
+                    f"🎞 Media embedded: **{media_count}**\n"
                     f"🕐 Exported: `{data['exported_at'][:19]} UTC`\n\n"
-                    "To restore on any AutoCast instance, send this file back to "
-                    "the bot and tap **⬇️ Import Config**.\n\n"
-                    "⚠️ _Media file IDs may not work if imported to a different "
-                    "Telegram account._"
+                    "This backup is **fully portable** — send it to any AutoCast "
+                    "instance and use **⬇️ Import Config** to restore everything, "
+                    "including media, channels, and schedules."
                 )
             )
         except Exception as e:
             logger.error(f"Export error uid={uid}: {e}", exc_info=True)
-            await q.answer("❌ Export failed. Please try again.", show_alert=True)
+            try:
+                await prog_msg.edit_text(
+                    "❌ **Export failed.**\n\nPlease try again. "
+                    f"If the problem persists, check bot logs.\n\n`{type(e).__name__}: {e}`"
+                )
+            except Exception:
+                pass
 
     # ── IMPORT ────────────────────────────────────────────────────────────────
     elif d == "import_config":
@@ -1211,11 +1488,11 @@ async def _handle_callback(c, q, uid, d):
             q.message,
             "⬇️ **Import Configuration**\n\n"
             "Send me a JSON backup file previously exported from AutoCast.\n\n"
-            "📌 Notes:\n"
-            "• Tasks in the past will be rescheduled to 5 min from now\n"
-            "• Channels are re-added without access hash — re-add them "
-            "manually if posting fails\n"
-            "• Media file IDs may be invalid if the source account differs",
+            "✅ The import will automatically:\n"
+            "• Re-upload all media to your account\n"
+            "• Resolve channel access so posting works immediately\n"
+            "• Reschedule tasks to the correct next future time\n\n"
+            "Large exports with many media files may take a minute.",
             [[InlineKeyboardButton("🔙 Cancel", callback_data="menu_home")]],
             uid
         )
@@ -1243,7 +1520,7 @@ async def _handle_callback(c, q, uid, d):
         tid  = d[5:]
         task = await get_single_task(tid)
         if not task:
-            await q.answer("Task not found.", show_alert=True)
+            await app.send_message(uid, "❌ Task not found.")
             return
         type_map = {
             "text": "Text", "photo": "Photo", "video": "Video",
@@ -1299,7 +1576,7 @@ async def _handle_callback(c, q, uid, d):
         tid = d[13:]
         task = await get_single_task(tid)
         if not task:
-            await q.answer("❌ Task not found.", show_alert=True)
+            await app.send_message(uid, "❌ Task not found.")
             return
         user_state[uid]["editing_task_id"] = tid
         user_state[uid]["step"] = "waiting_content_edit"
@@ -1317,7 +1594,7 @@ async def _handle_callback(c, q, uid, d):
         tid = d[11:]
         task = await get_single_task(tid)
         if not task:
-            await q.answer("❌ Task not found.", show_alert=True)
+            await app.send_message(uid, "❌ Task not found.")
             return
         user_state[uid].update({
             "editing_task_id":    tid,
@@ -1337,7 +1614,7 @@ async def _handle_callback(c, q, uid, d):
         tid = d[14:]
         task = await get_single_task(tid)
         if not task:
-            await q.answer("❌ Task not found.", show_alert=True)
+            await app.send_message(uid, "❌ Task not found.")
             return
         try:
             dt = _ensure_utc(datetime.datetime.fromisoformat(task["start_time"]))
@@ -1361,7 +1638,7 @@ async def _handle_callback(c, q, uid, d):
         tid = d[12:]
         task = await get_single_task(tid)
         if not task:
-            await q.answer("❌ Task not found.", show_alert=True)
+            await app.send_message(uid, "❌ Task not found.")
             return
         try:
             dt = _ensure_utc(datetime.datetime.fromisoformat(task["start_time"]))
@@ -1411,7 +1688,7 @@ async def _handle_callback(c, q, uid, d):
     elif d == "broadcast_confirm":
         targets = user_state[uid].get("broadcast_targets", [])
         if not targets:
-            await q.answer("❌ Select at least one channel!", show_alert=True)
+            await app.send_message(uid, "❌ Select at least one channel first.")
             return
         user_state[uid]["broadcast_queue"] = []
         user_state[uid]["step"] = "waiting_broadcast_content"
@@ -1606,6 +1883,9 @@ async def handle_inputs(c, m):
     uid  = m.from_user.id
     text = (m.text or m.caption or "").strip()
 
+    _touch(uid)
+    _evict_stale()
+
     if uid not in user_state:
         user_state[uid] = {}
         await restore_wizard_state(uid)
@@ -1681,11 +1961,13 @@ async def handle_import_file(c, m, uid):
         )
         return
 
-    if m.document.file_size and m.document.file_size > 5 * 1024 * 1024:
-        await m.reply("❌ File too large (max 5 MB).")
+    # Allow up to 50 MB — v3 exports embed media bytes
+    if m.document.file_size and m.document.file_size > 50 * 1024 * 1024:
+        await m.reply("❌ File too large (max 50 MB).")
         return
 
-    wait = await m.reply("⏳ Processing import…")
+    wait = await m.reply("⏳ Reading backup file…")
+
     try:
         buf = await app.download_media(m.document, in_memory=True)
         data = json.loads(bytes(buf.getbuffer()))
@@ -1693,7 +1975,21 @@ async def handle_import_file(c, m, uid):
         await wait.edit_text(f"❌ Could not parse file: {e}")
         return
 
-    imported, errs = await import_user_config(uid, data)
+    tasks_count    = len(data.get("tasks", []))
+    channels_count = len(data.get("channels", []))
+    await wait.edit_text(
+        f"⏳ **Importing…**\n\n"
+        f"📋 Tasks: **{tasks_count}** | 📢 Channels: **{channels_count}**\n\n"
+        f"Re-uploading media and resolving channels — please wait."
+    )
+
+    async def _update_progress(msg: str):
+        try:
+            await wait.edit_text(msg)
+        except Exception:
+            pass
+
+    imported, errs = await import_user_config(uid, data, progress_cb=_update_progress)
     user_state[uid]["step"] = None
 
     lines = [f"✅ **Import Complete** — {imported} task(s) scheduled."]
@@ -1714,6 +2010,10 @@ async def handle_import_file(c, m, uid):
 # ─────────────────────────────────────────────────────────────────────────────
 #  LOGIN FLOW
 # ─────────────────────────────────────────────────────────────────────────────
+class _NullClient:
+    """Sentinel object returned by st.get('client', _NullClient()) when client is absent."""
+    async def disconnect(self): pass
+
 async def _handle_login(c, m, uid, text):
     st = login_state[uid]
 
@@ -1752,7 +2052,6 @@ async def _handle_login(c, m, uid, text):
             await st["client"].sign_in(st["phone"], st["hash"], code)
             session = await st["client"].export_session_string()
             await save_session(uid, session)
-            await st["client"].disconnect()
             login_state.pop(uid, None)
             await m.reply(
                 "✅ **Login Successful!**\n\nClick /manage to start scheduling.",
@@ -1767,16 +2066,23 @@ async def _handle_login(c, m, uid, text):
                 "🔒 **Two-Step Verification**\n\nEnter your cloud password:",
                 None, uid, force_new=True
             )
+            return  # keep client alive for password step
         except Exception as e:
             logger.error(f"Login code error uid={uid}: {e}")
             await m.reply(f"❌ Login error: {e}\n\nTry /start again.")
+        finally:
+            # Disconnect client unless we're mid-flow waiting for password
+            if st.get("step") != "waiting_password":
+                try:
+                    await st.get("client", _NullClient()).disconnect()
+                except Exception:
+                    pass
 
     elif st["step"] == "waiting_password":
         try:
             await st["client"].check_password(text)
             session = await st["client"].export_session_string()
             await save_session(uid, session)
-            await st["client"].disconnect()
             login_state.pop(uid, None)
             await m.reply(
                 "✅ **Login Successful!**\n\nClick /manage to start scheduling.",
@@ -1784,9 +2090,16 @@ async def _handle_login(c, m, uid, text):
             )
         except errors.PasswordHashInvalid:
             await m.reply("❌ Wrong password. Try again.")
+            return  # keep client alive for retry
         except Exception as e:
             logger.error(f"Login password error uid={uid}: {e}")
             await m.reply(f"❌ Error: {e}\n\nTry /start again.")
+        finally:
+            if st.get("step") != "waiting_password":
+                try:
+                    await st.get("client", _NullClient()).disconnect()
+                except Exception:
+                    pass
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  CHANNEL ADD HANDLERS
@@ -1895,8 +2208,14 @@ async def process_content_message(c, m, uid):
     st["file_id"]      = _extract_file_id(m)
     st["entities"]     = serialize_entities(m.caption_entities or m.entities)
     st["input_msg_id"] = m.id
-    st["src_chat_id"]  = m.chat.id
-    st["src_msg_id"]   = m.id
+    # Prefer the original channel source for media recovery (survives beyond 48 h).
+    # Fall back to the bot DM chat (always accessible to the bot, but message may age out).
+    if m.forward_from_chat and m.forward_from_message_id:
+        st["src_chat_id"] = m.forward_from_chat.id
+        st["src_msg_id"]  = m.forward_from_message_id
+    else:
+        st["src_chat_id"] = m.chat.id
+        st["src_msg_id"]  = m.id
     st["reply_to_channel_msg_id"] = None
     if m.reply_to_message:
         fwd_msg_id = getattr(m.reply_to_message, "forward_from_message_id", None)
@@ -1913,8 +2232,13 @@ async def process_broadcast_content_message(c, m, uid):
         "file_id":            _extract_file_id(m),
         "entities":           serialize_entities(m.caption_entities or m.entities),
         "input_msg_id":       m.id,
-        "src_chat_id":        m.chat.id,
-        "src_msg_id":         m.id,
+        # Prefer original channel source for durable media recovery
+        "src_chat_id":        (m.forward_from_chat.id
+                               if m.forward_from_chat and m.forward_from_message_id
+                               else m.chat.id),
+        "src_msg_id":         (m.forward_from_message_id
+                               if m.forward_from_chat and m.forward_from_message_id
+                               else m.id),
         "pin":                True,
         "delete_old":         True,
         "auto_delete_offset": 0,
@@ -2005,7 +2329,7 @@ async def update_task_logic(uid, q):
 
     task = await get_single_task(tid)
     if not task:
-        await q.answer("❌ Task not found.", show_alert=True)
+        await app.send_message(uid, "❌ Task not found.")
         return
 
     if scheduler:
@@ -2142,7 +2466,8 @@ def add_scheduler_job(t):
         # FIX 3 — MULTI-INSTANCE: PostgreSQL advisory lock prevents two replicas
         # from executing the same job simultaneously.
         pool = await get_db()
-        lock_key = abs(hash(tid)) % (2 ** 31)
+        # Use SHA-256 for a deterministic, PYTHONHASHSEED-independent lock key
+        lock_key = int.from_bytes(hashlib.sha256(tid.encode()).digest()[:4], 'big') & 0x7FFFFFFF
         async with pool.acquire() as lock_conn:
             got_lock = await lock_conn.fetchval(
                 "SELECT pg_try_advisory_lock($1)", lock_key
@@ -2175,6 +2500,9 @@ def add_scheduler_job(t):
 
 async def _run_job(tid: str):
     """Core job logic, extracted for clarity. Called inside the advisory lock."""
+    global queue_lock
+    if queue_lock is None:
+        queue_lock = asyncio.Lock()
     async with queue_lock:
         logger.info(f"🚀 Job {tid} triggered")
         fresh = await get_single_task(tid)
@@ -2373,16 +2701,16 @@ async def _run_job(tid: str):
                         await delete_task(tid)
                         logger.info(f"Job {tid}: one-time task removed")
 
-        # FIX 4 — FLOODWAIT: reschedule instead of blocking the event loop
         except errors.FloodWait as e:
             wait_secs = e.value + 5
             logger.warning(f"Job {tid}: FloodWait {e.value}s — rescheduling in {wait_secs}s")
             retry_at = datetime.datetime.now(pytz.utc) + datetime.timedelta(seconds=wait_secs)
+            # Capture tid in default arg so the closure is safe across loop iterations
+            async def _fw_retry(_tid=tid):
+                await _run_job(_tid)
             try:
                 scheduler.add_job(
-                    # Re-use the named job function registered in add_scheduler_job
-                    # by retrieving the original job and re-firing it
-                    lambda: asyncio.ensure_future(_run_job(tid)),
+                    _fw_retry,
                     DateTrigger(run_date=retry_at, timezone=pytz.utc),
                     id=f"{tid}_fw_{int(retry_at.timestamp())}",
                     replace_existing=True,

@@ -1,7 +1,6 @@
 pyrogram==2.0.106
-TgCrypto
-asyncpg
+TgCrypto==1.2.2
+asyncpg==0.29.0
 APScheduler==3.10.4
-pytz
-cryptography
-cryptography
+pytz==2024.1
+cryptography==42.0.8

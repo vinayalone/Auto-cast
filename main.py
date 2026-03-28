@@ -693,6 +693,30 @@ async def delete_all_user_data(user_id):
     user_state.pop(user_id, None)
     login_state.pop(user_id, None)
 
+async def clear_db_data(user_id):
+    """
+    Delete all tasks, channels, settings and wizard state for user_id,
+    but keep the Telegram session so the user stays logged in.
+    Scheduler jobs are removed so nothing fires after the wipe.
+    """
+    pool = await get_db()
+    tasks = await pool.fetch(
+        "SELECT task_id FROM userbot_tasks_v11 WHERE owner_id=$1", user_id
+    )
+    if scheduler:
+        for t in tasks:
+            try: scheduler.remove_job(t["task_id"])
+            except Exception: pass
+
+    await pool.execute("DELETE FROM userbot_tasks_v11   WHERE owner_id=$1", user_id)
+    await pool.execute("DELETE FROM userbot_channels     WHERE user_id=$1",  user_id)
+    await pool.execute("DELETE FROM userbot_settings     WHERE user_id=$1",  user_id)
+    await pool.execute("DELETE FROM userbot_wizard_state WHERE user_id=$1",  user_id)
+
+    tz_cache.pop(user_id, None)
+    user_state.pop(user_id, None)
+    _user_last_seen.pop(user_id, None)
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  AUTO-DELETE HELPER
 # ─────────────────────────────────────────────────────────────────────────────
@@ -977,17 +1001,58 @@ async def import_user_config(uid: int, data: dict,
 
     try:
         channels = data.get("channels", [])
-        if channels:
-            await _progress(f"⏳ Resolving {len(channels)} channel(s)…")
+
+        # ── FIX 14: One-time dialog scan replaces per-channel warm_peer calls ──
+        # The old approach called warm_peer_and_get_hash once per channel, each
+        # of which issued its own GetDialogs scan. On a fresh session with many
+        # channels this triggers flood-wait limits and times out, leaving every
+        # channel with access_hash=0 and all jobs silently broken.
+        # Fix: scan dialogs ONCE, build a full lookup map, then resolve each
+        # channel from that map — or fall back to a single get_chat() call.
+        ah_map: dict[int, int] = {}
+        if user_client_ctx and channels:
+            await _progress(f"⏳ Scanning your dialogs to resolve {len(channels)} channel(s)…")
+            try:
+                async for dialog in user_client_ctx.get_dialogs():
+                    cid_d = dialog.chat.id
+                    ah_d  = getattr(dialog.chat, "access_hash", 0) or 0
+                    if ah_d:
+                        ah_map[cid_d] = ah_d
+                logger.info(f"Import uid={uid}: dialog scan found {len(ah_map)} peer(s)")
+            except Exception as e:
+                logger.warning(f"Import dialog scan uid={uid}: {e}")
+
         for ch in channels:
             cid_str = str(ch["channel_id"])
+            cid_int = int(cid_str)
             title   = ch.get("title", "Imported Channel")
-            ah = 0
-            if user_client_ctx:
+
+            # Fast path: use the pre-built dialog map
+            ah = ah_map.get(cid_int, 0)
+
+            # Slow path: single get_chat() call (works if peer is now cached
+            # after the dialog scan above, or resolvable from session)
+            if not ah and user_client_ctx:
                 try:
-                    ah = await warm_peer_and_get_hash(user_client_ctx, uid, int(cid_str))
+                    chat = await asyncio.wait_for(
+                        user_client_ctx.get_chat(cid_int), timeout=8.0
+                    )
+                    ah = getattr(chat, "access_hash", 0) or 0
+                    if getattr(chat, "title", None):
+                        title = chat.title
                 except Exception as e:
-                    logger.warning(f"import warm_peer {cid_str}: {e}")
+                    logger.debug(f"import get_chat {cid_str}: {e}")
+
+            # ── FIX 15: per-channel warning when access_hash still missing ──
+            # Previously this was silent — channels got stored with ah=0 and
+            # every job then failed with "user must re-add it" in the logs,
+            # with no visible feedback to the user at all.
+            if not ah:
+                errs.append(
+                    f"⚠️ Channel **{title}** (`{cid_str}`): could not resolve peer. "
+                    "Make sure your account is an admin of this channel, then use "
+                    "➕ Add Channel to re-link it so scheduled posts can reach it."
+                )
             try:
                 await add_channel(uid, cid_str, title, ah)
             except Exception as e:
@@ -1159,6 +1224,7 @@ async def show_main_menu(m, uid, force_new=False):
         [InlineKeyboardButton("⬆️ Export Config",           callback_data="export_config"),
          InlineKeyboardButton("⬇️ Import Config",           callback_data="import_config")],
         [engine_btn],
+        [InlineKeyboardButton("🗑 Clear Database",          callback_data="clear_db")],
         [InlineKeyboardButton("🚪 Logout",                  callback_data="logout")],
     ]
     body = (
@@ -1557,28 +1623,48 @@ async def _handle_callback(c, q, uid, d):
             "SELECT COUNT(*) FROM userbot_tasks_v11 WHERE owner_id=$1", uid
         )
         kb = [
-            [InlineKeyboardButton("⚠️ Yes, Logout", callback_data="logout_step_2")],
-            [InlineKeyboardButton("🔙 Cancel",       callback_data="menu_home")],
+            [InlineKeyboardButton("⚠️ Yes, Continue", callback_data="logout_step_2")],
+            [InlineKeyboardButton("🔙 Cancel",          callback_data="menu_home")],
         ]
         await update_menu(
             q.message,
-            f"⚠️ **Logout Confirmation**\n\n"
-            f"You have **{count} active task(s)** scheduled.\n"
-            f"Logging out will stop all scheduled posts.",
+            f"⚠️ **Logout — Step 1 of 3**\n\n"
+            f"You have **{count} active task(s)** scheduled.\n\n"
+            f"Logging out will **terminate your Telegram session** and "
+            f"stop all scheduled posts permanently.",
             kb, uid
         )
 
     elif d == "logout_step_2":
         kb = [
-            [InlineKeyboardButton("🗑 Delete Everything & Logout", callback_data="logout_final")],
-            [InlineKeyboardButton("🔙 Go Back",                    callback_data="menu_home")],
+            [InlineKeyboardButton("⚠️ Yes, I'm Sure", callback_data="logout_step_3")],
+            [InlineKeyboardButton("🔙 Cancel",          callback_data="menu_home")],
         ]
         await update_menu(
             q.message,
-            "🛑 **FINAL WARNING**\n\n"
-            "This will permanently delete all your scheduled posts, "
-            "channels, and session. This cannot be undone.\n\n"
-            "Are you absolutely sure?",
+            "🛑 **Logout — Step 2 of 3**\n\n"
+            "This will **permanently delete** all your scheduled posts, "
+            "channels and your saved session.\n\n"
+            "Your Telegram account itself is **not** affected — only "
+            "the data stored in this bot.\n\n"
+            "Are you sure you want to continue?",
+            kb, uid
+        )
+
+    elif d == "logout_step_3":
+        kb = [
+            [InlineKeyboardButton("🗑 Delete Everything & Logout", callback_data="logout_final")],
+            [InlineKeyboardButton("🔙 Cancel",                      callback_data="menu_home")],
+        ]
+        await update_menu(
+            q.message,
+            "🚨 **Logout — Step 3 of 3 — FINAL WARNING**\n\n"
+            "This is your **last chance** to go back.\n\n"
+            "Pressing the button below will:\n"
+            "• Remove all scheduled tasks\n"
+            "• Unlink all channels\n"
+            "• Terminate your Telegram session in this bot\n\n"
+            "**This cannot be undone.**",
             kb, uid
         )
 
@@ -1596,6 +1682,80 @@ async def _handle_callback(c, q, uid, d):
                 uid,
                 "👋 **Logged out successfully.**\n\n"
                 "All data has been wiped. Use /start to begin again."
+            )
+        except Exception:
+            pass
+
+    elif d == "clear_db":
+        pool = await get_db()
+        task_count = await pool.fetchval(
+            "SELECT COUNT(*) FROM userbot_tasks_v11 WHERE owner_id=$1", uid
+        )
+        ch_count = await pool.fetchval(
+            "SELECT COUNT(*) FROM userbot_channels WHERE user_id=$1", uid
+        )
+        kb = [
+            [InlineKeyboardButton("⚠️ Yes, Continue", callback_data="clear_db_step_2")],
+            [InlineKeyboardButton("🔙 Cancel",          callback_data="menu_home")],
+        ]
+        await update_menu(
+            q.message,
+            f"🗑 **Clear Database — Step 1 of 3**\n\n"
+            f"You have **{task_count} task(s)** and **{ch_count} channel(s)**.\n\n"
+            f"This will delete all tasks, channels and settings.\n"
+            f"**Your Telegram session is kept** — you will stay logged in.",
+            kb, uid
+        )
+
+    elif d == "clear_db_step_2":
+        kb = [
+            [InlineKeyboardButton("⚠️ Yes, I'm Sure", callback_data="clear_db_step_3")],
+            [InlineKeyboardButton("🔙 Cancel",          callback_data="menu_home")],
+        ]
+        await update_menu(
+            q.message,
+            "🛑 **Clear Database — Step 2 of 3**\n\n"
+            "All scheduled posts will stop immediately.\n"
+            "All linked channels will be unlinked.\n"
+            "All settings (timezone, engine state) will be reset.\n\n"
+            "Your login session will **not** be touched.\n\n"
+            "Are you sure you want to continue?",
+            kb, uid
+        )
+
+    elif d == "clear_db_step_3":
+        kb = [
+            [InlineKeyboardButton("🗑 Clear Everything", callback_data="clear_db_final")],
+            [InlineKeyboardButton("🔙 Cancel",            callback_data="menu_home")],
+        ]
+        await update_menu(
+            q.message,
+            "🚨 **Clear Database — Step 3 of 3 — FINAL WARNING**\n\n"
+            "This is your **last chance** to go back.\n\n"
+            "Pressing the button below will permanently erase:\n"
+            "• All scheduled tasks\n"
+            "• All linked channels\n"
+            "• All bot settings\n\n"
+            "**This cannot be undone.**",
+            kb, uid
+        )
+
+    elif d == "clear_db_final":
+        try:
+            await app.edit_message_text(
+                uid, q.message.id,
+                "⏳ **Clearing database…** removing all tasks and channels."
+            )
+        except Exception:
+            pass
+        await clear_db_data(uid)
+        user_state[uid] = {}
+        try:
+            await app.send_message(
+                uid,
+                "✅ **Database cleared.**\n\n"
+                "All tasks, channels and settings have been deleted.\n"
+                "You are still logged in — use /manage to start fresh."
             )
         except Exception:
             pass
@@ -2777,6 +2937,44 @@ async def _run_job(tid: str):
                         f"Job {tid}: cannot resolve channel {fresh['chat_id']} — "
                         "user must re-add it"
                     )
+                    # ── FIX 16: notify user + auto-pause on unresolvable channel ──
+                    # Previously this just returned silently. The task would retry
+                    # on every interval, log the same error each time, and the user
+                    # had no idea anything was wrong until they checked Railway logs.
+                    # Fix: pause the task immediately so it stops firing, then send
+                    # the user a clear Telegram notification with remediation steps.
+                    try:
+                        await set_task_paused(tid, True)
+                        if scheduler:
+                            try:
+                                scheduler.pause_job(tid)
+                            except Exception:
+                                pass
+                        pool_n = await get_db()
+                        ch_row = await pool_n.fetchrow(
+                            "SELECT title FROM userbot_channels "
+                            "WHERE user_id=$1 AND channel_id=$2",
+                            fresh["owner_id"], fresh["chat_id"]
+                        )
+                        ch_label = (ch_row["title"] if ch_row else None) or fresh["chat_id"]
+                        await app.send_message(
+                            fresh["owner_id"],
+                            f"⚠️ **Scheduled post paused**\n\n"
+                            f"Task `{tid}` could not reach channel **{ch_label}** "
+                            f"(`{fresh['chat_id']}`) — your account is no longer "
+                            f"recognised as an admin there.\n\n"
+                            f"This task has been **paused automatically** to stop "
+                            f"repeated failures.\n\n"
+                            f"**To fix:**\n"
+                            f"1. Confirm your account is still an admin of that channel.\n"
+                            f"2. Re-add it via ➕ **Add Channel**.\n"
+                            f"3. Open the task and tap ▶️ **Resume Task**."
+                        )
+                    except Exception as notify_err:
+                        logger.warning(
+                            f"Job {tid}: failed to send unresolvable-channel "
+                            f"notification: {notify_err}"
+                        )
                     return
                 await _warm_peer_in_client(user, target_int, access_hash)
 

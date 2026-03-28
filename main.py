@@ -829,22 +829,58 @@ def _next_future_run(original_iso: str, interval_str: str | None,
         return now_utc + datetime.timedelta(minutes=5)
 
 
-async def _download_media_bytes(file_id: str) -> bytes | None:
-    # FIX 19: wrap with timeout — Pyrogram retries upload.GetFile indefinitely on
-    # network stalls, blocking the export for minutes per file with no feedback.
-    try:
-        buf = await asyncio.wait_for(
-            app.download_media(file_id, in_memory=True), timeout=45.0
-        )
-        if buf:
-            raw = bytes(buf.getbuffer())
-            if len(raw) <= _MAX_MEDIA_EMBED_BYTES:
-                return raw
-            logger.warning(f"Media {file_id[:20]}… too large to embed ({len(raw)} bytes)")
-    except asyncio.TimeoutError:
-        logger.warning(f"Media {file_id[:20]}… download timed out after 45s — skipping")
-    except Exception as e:
-        logger.warning(f"Could not download media {file_id[:20]}…: {e}")
+async def _download_media_bytes(file_id: str, user_client=None) -> bytes | None:
+    """
+    FIX 19 / FIX 24: Download media for export without ever silently skipping.
+
+    Strategy:
+      1. Try the user's own session client first — it runs on an isolated TCP
+         connection that is NOT shared with job clients, so upload.GetFile
+         congestion on the bot's main connection doesn't affect it.
+      2. Fall back to the bot client (app) with 3 attempts + exponential backoff
+         so transient congestion is retried rather than silently dropped.
+    """
+    fid_short = file_id[:20] + "…"
+
+    # ── Tier 1: user session client (isolated connection) ──────────────────
+    if user_client is not None:
+        try:
+            buf = await asyncio.wait_for(
+                user_client.download_media(file_id, in_memory=True), timeout=60.0
+            )
+            if buf:
+                raw = bytes(buf.getbuffer())
+                if len(raw) <= _MAX_MEDIA_EMBED_BYTES:
+                    return raw
+                logger.warning(f"Media {fid_short} too large to embed ({len(raw)} bytes) — omitting bytes")
+                return None
+        except asyncio.TimeoutError:
+            logger.warning(f"Media {fid_short}: user-client download timed out — falling back to bot client")
+        except Exception as e:
+            logger.warning(f"Media {fid_short}: user-client download failed ({e}) — falling back to bot client")
+
+    # ── Tier 2: bot client with retries ────────────────────────────────────
+    for attempt in range(1, 4):          # attempts 1, 2, 3
+        delay = 0 if attempt == 1 else 10 * (attempt - 1)   # 0s, 10s, 20s
+        if delay:
+            logger.info(f"Media {fid_short}: retrying bot-client download in {delay}s (attempt {attempt}/3)…")
+            await asyncio.sleep(delay)
+        try:
+            buf = await asyncio.wait_for(
+                app.download_media(file_id, in_memory=True), timeout=45.0
+            )
+            if buf:
+                raw = bytes(buf.getbuffer())
+                if len(raw) <= _MAX_MEDIA_EMBED_BYTES:
+                    return raw
+                logger.warning(f"Media {fid_short} too large to embed ({len(raw)} bytes) — omitting bytes")
+                return None
+        except asyncio.TimeoutError:
+            logger.warning(f"Media {fid_short}: bot-client download timed out (attempt {attempt}/3)")
+        except Exception as e:
+            logger.warning(f"Media {fid_short}: bot-client download error (attempt {attempt}/3): {e}")
+
+    logger.error(f"Media {fid_short}: all download attempts exhausted — task will be exported WITHOUT media bytes")
     return None
 
 
@@ -909,6 +945,11 @@ async def export_user_config(uid: int) -> dict:
     reply_task_index (a stable int index into the tasks list) so it survives import
     onto a different account with different task_ids.
     Channel message IDs (numeric strings) are kept as-is in reply_target.
+
+    FIX 24 (export side): media downloads now use the user's own session client
+    (isolated TCP connection) as the primary path, with bot-client fallback + 3
+    retries.  Each task is individually guarded so one bad download never prevents
+    the rest of the tasks from being exported.
     """
     pool = await get_db()
     tasks    = [dict(r) for r in await pool.fetch(
@@ -924,43 +965,88 @@ async def export_user_config(uid: int) -> dict:
     # Build task_id → index map for reply_target remapping
     task_id_to_index = {t["task_id"]: i for i, t in enumerate(tasks)}
 
+    # ── Spin up user-session client for media downloads ───────────────────
+    # This gives us an isolated TCP connection that isn't starved by concurrent
+    # job clients hammering the bot's main connection with upload.GetFile calls.
+    export_user_client = None
+    try:
+        session = await get_session(uid)
+        if session:
+            export_user_client = Client(
+                ":memory:", api_id=API_ID, api_hash=API_HASH,
+                session_string=session, device_model="AutoCast",
+                system_version="Railway", app_version="2.0",
+            )
+            await export_user_client.start()
+            logger.info(f"Export uid={uid}: user-session client started for media downloads")
+    except Exception as e:
+        logger.warning(f"Export uid={uid}: could not start user-session client ({e}) — using bot client only")
+        export_user_client = None
+
     export_tasks = []
-    for t in tasks:
-        rt = t.get("reply_target")
-        reply_target_export  = None
-        reply_task_index     = None
+    try:
+        for t in tasks:
+            # ── Per-task isolation: a crash here never drops the remaining tasks ──
+            entry = None          # ensure the name is always bound before the except
+            try:
+                rt = t.get("reply_target")
+                reply_target_export  = None
+                reply_task_index     = None
 
-        if rt:
-            rt_str = str(rt).strip()
-            if rt_str.startswith("task_") and rt_str in task_id_to_index:
-                # Cross-reference to a sibling task — store as stable index
-                reply_task_index = task_id_to_index[rt_str]
-            elif rt_str:
-                # Channel message ID or other stable reference — keep as-is
-                reply_target_export = rt_str
+                if rt:
+                    rt_str = str(rt).strip()
+                    if rt_str.startswith("task_") and rt_str in task_id_to_index:
+                        # Cross-reference to a sibling task — store as stable index
+                        reply_task_index = task_id_to_index[rt_str]
+                    elif rt_str:
+                        # Channel message ID or other stable reference — keep as-is
+                        reply_target_export = rt_str
 
-        entry = {
-            "chat_id":            t["chat_id"],
-            "content_type":       t["content_type"],
-            "content_text":       t["content_text"],
-            "file_id":            t["file_id"],
-            "entities":           t["entities"],
-            "pin":                t["pin"],
-            "delete_old":         t["delete_old"],
-            "repeat_interval":    t["repeat_interval"],
-            "start_time":         t["start_time"],
-            "auto_delete_offset": t.get("auto_delete_offset", 0),
-            "reply_target":       reply_target_export,
-            "reply_task_index":   reply_task_index,   # NEW: stable cross-reference
-            "src_chat_id":        t.get("src_chat_id", 0),
-            "src_msg_id":         t.get("src_msg_id", 0),
-            "media_bytes":        None,
-        }
-        if t["content_type"] not in ("text", "poll") and t.get("file_id"):
-            raw = await _download_media_bytes(t["file_id"])
-            if raw:
-                entry["media_bytes"] = base64.b64encode(raw).decode()
-        export_tasks.append(entry)
+                entry = {
+                    "chat_id":            t["chat_id"],
+                    "content_type":       t["content_type"],
+                    "content_text":       t["content_text"],
+                    "file_id":            t["file_id"],
+                    "entities":           t["entities"],
+                    "pin":                t["pin"],
+                    "delete_old":         t["delete_old"],
+                    "repeat_interval":    t["repeat_interval"],
+                    "start_time":         t["start_time"],
+                    "auto_delete_offset": t.get("auto_delete_offset", 0),
+                    "reply_target":       reply_target_export,
+                    "reply_task_index":   reply_task_index,
+                    "src_chat_id":        t.get("src_chat_id", 0),
+                    "src_msg_id":         t.get("src_msg_id", 0),
+                    "media_bytes":        None,
+                }
+                if t["content_type"] not in ("text", "poll") and t.get("file_id"):
+                    raw = await _download_media_bytes(
+                        t["file_id"], user_client=export_user_client
+                    )
+                    if raw:
+                        entry["media_bytes"] = base64.b64encode(raw).decode()
+            except Exception as task_err:
+                logger.error(f"Export uid={uid}: task {t.get('task_id','?')} — unexpected error ({task_err}); including without media")
+                if entry is None:
+                    # build a minimal safe shell so the task still shows up in the backup
+                    entry = {
+                        "chat_id":       t.get("chat_id"),
+                        "content_type":  t.get("content_type"),
+                        "content_text":  t.get("content_text"),
+                        "file_id":       t.get("file_id"),
+                        "repeat_interval": t.get("repeat_interval"),
+                        "start_time":    t.get("start_time"),
+                        "media_bytes":   None,
+                        "_export_error": str(task_err),
+                    }
+
+            export_tasks.append(entry)
+    finally:
+        if export_user_client:
+            try:
+                await export_user_client.stop()
+            except Exception:
+                pass
 
     return {
         "version":     EXPORT_VERSION,

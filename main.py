@@ -1817,7 +1817,34 @@ async def _handle_callback(c, q, uid, d):
         await show_task_details(uid, q.message, tid)
 
     elif d.startswith("task_resume_"):
-        tid = d[12:]
+        tid  = d[12:]
+        task = await get_single_task(tid)
+        if task:
+            # FIX 18: if start_time is in the past when resuming, roll it forward
+            # to the next correct future interval so the task doesn't fire
+            # immediately as a misfire or show a stale past date to the user.
+            try:
+                st_dt = _ensure_utc(datetime.datetime.fromisoformat(task["start_time"]))
+                now_u = datetime.datetime.now(pytz.utc)
+                if st_dt < now_u and task.get("repeat_interval"):
+                    mins  = int(task["repeat_interval"].split("=")[1])
+                    delta = datetime.timedelta(minutes=mins)
+                    # Advance by however many full intervals have elapsed + 1
+                    elapsed  = now_u - st_dt
+                    periods  = int(elapsed.total_seconds() / delta.total_seconds()) + 1
+                    new_dt   = st_dt + delta * periods
+                    new_iso  = new_dt.isoformat()
+                    await update_next_run(tid, new_iso)
+                    task["start_time"] = new_iso
+                    logger.info(
+                        f"Resume {tid}: advanced stale start_time "
+                        f"from {st_dt.isoformat()} → {new_iso}"
+                    )
+            except Exception as e:
+                logger.warning(f"Resume {tid}: could not advance start_time: {e}")
+            # Re-register the scheduler job with the (possibly updated) start_time
+            # so APScheduler picks up the correct next fire time.
+            add_scheduler_job(task)
         await set_task_paused(tid, False)
         if scheduler:
             try: scheduler.resume_job(tid)
@@ -1856,11 +1883,40 @@ async def _handle_callback(c, q, uid, d):
         await set_all_tasks_paused(uid, False)
         if scheduler:
             pool = await get_db()
-            tids = await pool.fetch(
-                "SELECT task_id FROM userbot_tasks_v11 WHERE owner_id=$1", uid
+            all_tasks = await pool.fetch(
+                "SELECT * FROM userbot_tasks_v11 WHERE owner_id=$1", uid
             )
-            for row in tids:
-                try: scheduler.resume_job(row["task_id"])
+            now_u = datetime.datetime.now(pytz.utc)
+            for row in all_tasks:
+                task_d = dict(row)
+                # FIX 18 (engine): same stale-date fix applied to every task
+                # when the whole engine is restarted after a long pause.
+                try:
+                    st_dt = _ensure_utc(
+                        datetime.datetime.fromisoformat(task_d["start_time"])
+                    )
+                    if st_dt < now_u and task_d.get("repeat_interval"):
+                        mins  = int(task_d["repeat_interval"].split("=")[1])
+                        delta = datetime.timedelta(minutes=mins)
+                        elapsed = now_u - st_dt
+                        periods = int(elapsed.total_seconds() / delta.total_seconds()) + 1
+                        new_dt  = st_dt + delta * periods
+                        new_iso = new_dt.isoformat()
+                        await update_next_run(task_d["task_id"], new_iso)
+                        task_d["start_time"] = new_iso
+                        logger.info(
+                            f"Engine start: advanced {task_d['task_id']} "
+                            f"from {st_dt.isoformat()} → {new_iso}"
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"Engine start: could not advance {task_d['task_id']}: {e}"
+                    )
+                # Re-register with updated start_time so APScheduler
+                # computes the correct next fire time.
+                try: add_scheduler_job(task_d)
+                except Exception: pass
+                try: scheduler.resume_job(task_d["task_id"])
                 except Exception: pass
         await show_main_menu(q.message, uid)
 
@@ -2891,10 +2947,8 @@ async def _run_job(tid: str):
         logger.warning(f"Job {tid}: task gone from DB, skipping")
         return
 
-    if fresh.get("is_paused") or await get_engine_paused(fresh["owner_id"]):
-        logger.info(f"Job {tid}: skipped (paused)")
-        return
-
+    # Compute next_iso BEFORE the paused check so the schedule always advances,
+    # even when the task is paused and the message is not sent (FIX 17).
     next_iso = None
     if fresh["repeat_interval"]:
         try:
@@ -2904,6 +2958,19 @@ async def _run_job(tid: str):
             ).isoformat()
         except Exception as e:
             logger.error(f"Next-run calc error for {tid}: {e}")
+
+    if fresh.get("is_paused") or await get_engine_paused(fresh["owner_id"]):
+        logger.info(f"Job {tid}: skipped (paused) — advancing schedule to {next_iso}")
+        # FIX 17: still update start_time in DB so the next scheduled time stays
+        # current while the task is paused. Without this, pausing a task freezes
+        # its start_time in the past and the first post after resume appears
+        # immediately (or is treated as a misfire) rather than at the correct interval.
+        if next_iso:
+            try:
+                await update_next_run(tid, next_iso)
+            except Exception as e:
+                logger.warning(f"Job {tid}: failed to advance paused schedule: {e}")
+        return
 
     session = await get_session(fresh["owner_id"])
     if not session:

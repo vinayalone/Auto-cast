@@ -915,7 +915,7 @@ async def export_user_config(uid: int) -> dict:
         "SELECT * FROM userbot_tasks_v11 WHERE owner_id=$1", uid
     )]
     channels = [dict(r) for r in await pool.fetch(
-        "SELECT channel_id, title FROM userbot_channels WHERE user_id=$1", uid
+        "SELECT channel_id, title, access_hash FROM userbot_channels WHERE user_id=$1", uid
     )]
     settings = await pool.fetchrow(
         "SELECT timezone FROM userbot_settings WHERE user_id=$1", uid
@@ -1022,36 +1022,46 @@ async def import_user_config(uid: int, data: dict,
     try:
         channels = data.get("channels", [])
 
-        # ── FIX 14: One-time dialog scan replaces per-channel warm_peer calls ──
-        # The old approach called warm_peer_and_get_hash once per channel, each
-        # of which issued its own GetDialogs scan. On a fresh session with many
-        # channels this triggers flood-wait limits and times out, leaving every
-        # channel with access_hash=0 and all jobs silently broken.
-        # Fix: scan dialogs ONCE, build a full lookup map, then resolve each
-        # channel from that map — or fall back to a single get_chat() call.
+        # ── FIX 14 / FIX 23: Three-tier peer resolution ─────────────────────────
+        # Tier 0 — access_hash from the backup itself (valid for same account;
+        #           skips all network calls for channels already cached in export).
+        # Tier 1 — single dialog scan across BOTH the main folder (0) AND the
+        #           archived folder (1).  Per-dialog errors are isolated so a bad
+        #           entry never aborts the whole scan.
+        # Tier 2 — get_chat() fallback for any remaining unresolved channels
+        #           (works when the peer was cached during the scan, or can be
+        #           looked up directly from Telegram).
         ah_map: dict[int, int] = {}
         if user_client_ctx and channels:
             await _progress(f"⏳ Scanning your dialogs to resolve {len(channels)} channel(s)…")
-            try:
-                async for dialog in user_client_ctx.get_dialogs():
-                    cid_d = dialog.chat.id
-                    ah_d  = getattr(dialog.chat, "access_hash", 0) or 0
-                    if ah_d:
-                        ah_map[cid_d] = ah_d
-                logger.info(f"Import uid={uid}: dialog scan found {len(ah_map)} peer(s)")
-            except Exception as e:
-                logger.warning(f"Import dialog scan uid={uid}: {e}")
+            for folder_id in (0, 1):           # 0 = main inbox, 1 = archive
+                try:
+                    async for dialog in user_client_ctx.get_dialogs(folder_id=folder_id):
+                        try:
+                            cid_d = dialog.chat.id
+                            ah_d  = getattr(dialog.chat, "access_hash", 0) or 0
+                            if ah_d:
+                                ah_map[cid_d] = ah_d
+                        except Exception:
+                            continue          # bad dialog entry — skip, don't abort
+                except Exception as e:
+                    logger.warning(f"Import dialog scan folder={folder_id} uid={uid}: {e}")
+            logger.info(f"Import uid={uid}: dialog scan found {len(ah_map)} peer(s) (main+archive)")
 
         for ch in channels:
             cid_str = str(ch["channel_id"])
             cid_int = int(cid_str)
             title   = ch.get("title", "Imported Channel")
 
-            # Fast path: use the pre-built dialog map
-            ah = ah_map.get(cid_int, 0)
+            # Tier 0: use access_hash stored in the backup (same-account import
+            #         — access_hash is per-account, so it stays valid across sessions)
+            ah = int(ch.get("access_hash") or 0)
 
-            # Slow path: single get_chat() call (works if peer is now cached
-            # after the dialog scan above, or resolvable from session)
+            # Tier 1: use the pre-built dialog map (covers different-account imports)
+            if not ah:
+                ah = ah_map.get(cid_int, 0)
+
+            # Tier 2: single get_chat() call (works if peer was cached during scan)
             if not ah and user_client_ctx:
                 try:
                     chat = await asyncio.wait_for(

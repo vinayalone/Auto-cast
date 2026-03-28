@@ -3326,6 +3326,28 @@ async def _run_job(tid: str):
             ct  = fresh["content_type"]
             fid = fresh["file_id"]
 
+            # ── FIX 26: Pre-refresh file_id from source message ───────────────────
+            # Stored file_ids contain a "file reference" that Telegram expires over
+            # time.  Using a stale fid triggers FILE_REFERENCE_EXPIRED inside
+            # upload.GetFile, which Pyrogram retries 4× (each time reconnecting)
+            # before raising — producing the reconnect storm visible in the logs.
+            # Fix: fetch the source message via the user's own session to get a
+            # guaranteed-fresh file_id before every send attempt.
+            if ct not in ("text", "poll") and fid:
+                _src_cid = int(fresh.get("src_chat_id") or 0)
+                _src_mid = int(fresh.get("src_msg_id") or 0)
+                if _src_cid and _src_mid:
+                    try:
+                        _src_msg = await asyncio.wait_for(
+                            user.get_messages(_src_cid, _src_mid), timeout=15.0
+                        )
+                        _fresh_fid = _extract_media_file_id(_src_msg, ct)
+                        if _fresh_fid:
+                            fid = _fresh_fid
+                            logger.debug(f"Job {tid}: file_id pre-refreshed from src {_src_cid}/{_src_mid}")
+                    except Exception as _fre:
+                        logger.debug(f"Job {tid}: could not pre-refresh file_id from src: {_fre}")
+
             async def _send():
                 nonlocal sent
                 if ct == "text":
@@ -3365,34 +3387,64 @@ async def _run_job(tid: str):
 
             try:
                 await _send()
-            except (errors.FileIdInvalid, errors.MediaEmpty):
-                logger.warning(f"Job {tid}: {ct} file invalid/empty — attempting re-upload")
+            except (errors.FileIdInvalid, errors.MediaEmpty, errors.FileReferenceExpired) as _send_err:
+                logger.warning(f"Job {tid}: {ct} send failed ({type(_send_err).__name__}) — attempting recovery")
                 media = None
-                if fid:
+
+                # ── Recovery path 1: refresh file_id via user session + retry ──────
+                # Most reliable: the user can always read their own Saved Messages
+                # (where media was staged on import) to get a fresh file reference.
+                _rec_cid = int(fresh.get("src_chat_id") or 0)
+                _rec_mid = int(fresh.get("src_msg_id") or 0)
+                if _rec_cid and _rec_mid:
                     try:
-                        media = await asyncio.wait_for(
-                            app.download_media(fid, in_memory=True), timeout=45.0
+                        _rec_msg = await asyncio.wait_for(
+                            user.get_messages(_rec_cid, _rec_mid), timeout=15.0
                         )
-                    except asyncio.TimeoutError:
-                        logger.warning(f"Job {tid}: bot download timed out after 45s")
-                    except Exception as dl_e:
-                        logger.warning(f"Job {tid}: bot download failed: {dl_e}")
-                if media is None and fresh.get("src_chat_id") and fresh.get("src_msg_id"):
-                    try:
-                        media_msg = await app.forward_messages(
-                            fresh["owner_id"],
-                            from_chat_id=fresh["src_chat_id"],
-                            message_ids=fresh["src_msg_id"]
-                        )
-                        media = await asyncio.wait_for(
-                            app.download_media(media_msg, in_memory=True), timeout=45.0
-                        )
-                        await media_msg.delete()
-                    except asyncio.TimeoutError:
-                        logger.warning(f"Job {tid}: src forward download timed out after 45s")
-                    except Exception as fwd_e:
-                        logger.warning(f"Job {tid}: src forward failed: {fwd_e}")
-                if media is None:
+                        _rec_fid = _extract_media_file_id(_rec_msg, ct)
+                        if _rec_fid:
+                            fid = _rec_fid          # update closure for _send()
+                            try:
+                                await _send()       # retry with fresh fid
+                                media = "sent"      # signal that send succeeded
+                                logger.info(f"Job {tid}: recovered via refreshed file_id from src {_rec_cid}/{_rec_mid}")
+                            except Exception as _retry_err:
+                                logger.warning(f"Job {tid}: retry with refreshed fid failed: {_retry_err}")
+                    except Exception as _rec_err:
+                        logger.warning(f"Job {tid}: could not fetch src msg for recovery: {_rec_err}")
+
+                if media != "sent":
+                    # ── Recovery path 2: download raw bytes via user session + re-upload ──
+                    if fid:
+                        try:
+                            media = await asyncio.wait_for(
+                                user.download_media(fid, in_memory=True), timeout=45.0
+                            )
+                        except errors.FileReferenceExpired:
+                            logger.warning(f"Job {tid}: user download also expired — trying bot client")
+                        except asyncio.TimeoutError:
+                            logger.warning(f"Job {tid}: user download timed out after 45s")
+                        except Exception as dl_e:
+                            logger.warning(f"Job {tid}: user download failed: {dl_e}")
+                    # ── Recovery path 3: bot client forward (legacy fallback) ─────────
+                    if media is None and fresh.get("src_chat_id") and fresh.get("src_msg_id"):
+                        try:
+                            media_msg = await app.forward_messages(
+                                fresh["owner_id"],
+                                from_chat_id=fresh["src_chat_id"],
+                                message_ids=fresh["src_msg_id"]
+                            )
+                            media = await asyncio.wait_for(
+                                app.download_media(media_msg, in_memory=True), timeout=45.0
+                            )
+                            await media_msg.delete()
+                        except asyncio.TimeoutError:
+                            logger.warning(f"Job {tid}: src forward download timed out after 45s")
+                        except Exception as fwd_e:
+                            logger.warning(f"Job {tid}: src forward failed: {fwd_e}")
+                if media == "sent":
+                    pass  # already sent via recovery path 1 — sent is set by _send()
+                elif media is None:
                     logger.error(f"Job {tid}: cannot recover media for {ct}, skipping")
                     sent = None
                 else:

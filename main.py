@@ -541,29 +541,36 @@ async def warm_peer_and_get_hash(user_client, owner_id: int, channel_id: int,
     except Exception as e:
         logger.debug(f"warm_peer fast path failed for {channel_id}: {e}")
 
-    # Slow path: scan dialogs
+    # Slow path: scan dialogs in both main and archived folders
     async def _scan():
-        async for dialog in user_client.get_dialogs():
-            if dialog.chat.id == channel_id:
-                ah = getattr(dialog.chat, "access_hash", 0) or 0
-                if ah:
-                    pool = await get_db()
-                    await pool.execute(
-                        "UPDATE userbot_channels SET access_hash=$1 "
-                        "WHERE user_id=$2 AND channel_id=$3",
-                        ah, owner_id, str(channel_id)
-                    )
-                    logger.info(f"✅ Cached access_hash for {channel_id} (dialog scan) owner={owner_id}")
-                return ah
+        for folder_id in (0, 1):
+            try:
+                async for dialog in user_client.get_dialogs(folder_id=folder_id):
+                    if dialog.chat.id == channel_id:
+                        ah = getattr(dialog.chat, "access_hash", 0) or 0
+                        if ah:
+                            pool = await get_db()
+                            await pool.execute(
+                                "UPDATE userbot_channels SET access_hash=$1 "
+                                "WHERE user_id=$2 AND channel_id=$3",
+                                ah, owner_id, str(channel_id)
+                            )
+                            logger.info(
+                                f"✅ Cached access_hash for {channel_id} "
+                                f"(dialog scan folder={folder_id}) owner={owner_id}"
+                            )
+                        return ah
+            except Exception as e:
+                logger.warning(
+                    f"warm_peer get_dialogs folder={folder_id} failed for "
+                    f"{channel_id}: {e}"
+                )
         return 0
 
     try:
         return await asyncio.wait_for(_scan(), timeout=timeout)
     except asyncio.TimeoutError:
         logger.warning(f"warm_peer timed out after {timeout}s for channel {channel_id}")
-        return 0
-    except Exception as e:
-        logger.warning(f"warm_peer get_dialogs failed for {channel_id}: {e}")
         return 0
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -581,7 +588,7 @@ async def _warm_peer_in_client(user_client, target_int: int, access_hash: int):
     """
     try:
         await user_client.get_chat(target_int)
-        return
+        return True
     except Exception:
         pass
     if access_hash:
@@ -595,8 +602,10 @@ async def _warm_peer_in_client(user_client, target_int: int, access_hash: int):
                 raw_funcs.channels.GetChannels(id=[peer])
             )
             logger.debug(f"Peer {target_int} warmed via raw InputChannel")
+            return True
         except Exception as e:
             logger.warning(f"_warm_peer_in_client raw invoke failed for {target_int}: {e}")
+    return False
 
 async def get_channels(user_id):
     pool = await get_db()
@@ -801,7 +810,13 @@ async def delete_sent_message(owner_id, chat_id, message_id):
         chat_id_int = int(chat_id)
         async with _build_user_client(session_string=session) as user:
             # FIX 1: use _warm_peer_in_client instead of the broken inject_peer
-            await _warm_peer_in_client(user, chat_id_int, access_hash)
+            warmed = await _warm_peer_in_client(user, chat_id_int, access_hash)
+            if not warmed:
+                access_hash = await warm_peer_and_get_hash(user, owner_id, chat_id_int)
+                warmed = bool(access_hash) and await _warm_peer_in_client(user, chat_id_int, access_hash)
+            if not warmed:
+                logger.warning(f"Auto-delete: could not resolve chat {chat_id}")
+                return
             await user.delete_messages(chat_id_int, message_id)
             logger.info(f"🗑 Auto-deleted msg {message_id} in {chat_id}")
     except errors.MessageDeleteForbidden:
@@ -2306,6 +2321,12 @@ async def _handle_callback(c, q, uid, d):
                 (int(task["chat_id"]) if task.get("last_msg_id") else None, task.get("last_msg_id")),
             ]:
                 if src_chat and src_msg:
+                    src_chat = int(src_chat)
+                    src_msg = int(src_msg)
+                    # Saved Messages / self-chat sources belong to the user's session,
+                    # not the bot account, so bot-side copy_message is expected to fail.
+                    if src_chat == uid:
+                        continue
                     try:
                         await app.copy_message(uid, from_chat_id=src_chat, message_id=src_msg)
                         sent_media = True
@@ -3422,62 +3443,79 @@ async def _run_job(tid: str):
     sent = None
     try:
         async with _build_user_client(session_string=session) as user:
-            target_int  = int(fresh["chat_id"])
-            access_hash = await get_channel_access_hash(fresh["owner_id"], fresh["chat_id"])
+            async def _pause_unreachable_channel():
+                logger.error(
+                    f"Job {tid}: cannot resolve channel {fresh['chat_id']} — "
+                    "user must re-add it"
+                )
+                try:
+                    await set_task_paused(tid, True)
+                    if scheduler:
+                        try:
+                            scheduler.pause_job(tid)
+                        except Exception:
+                            pass
+                    pool_n = await get_db()
+                    ch_row = await pool_n.fetchrow(
+                        "SELECT title FROM userbot_channels "
+                        "WHERE user_id=$1 AND channel_id=$2",
+                        fresh["owner_id"], fresh["chat_id"]
+                    )
+                    ch_label = (ch_row["title"] if ch_row else None) or fresh["chat_id"]
+                    await app.send_message(
+                        fresh["owner_id"],
+                        f"⚠️ **Scheduled post paused**\n\n"
+                        f"Task `{tid}` could not reach channel **{ch_label}** "
+                        f"(`{fresh['chat_id']}`) — your account is no longer "
+                        f"recognised as an admin there.\n\n"
+                        f"This task has been **paused automatically** to stop "
+                        f"repeated failures.\n\n"
+                        f"**To fix:**\n"
+                        f"1. Confirm your account is still an admin of that channel.\n"
+                        f"2. Re-add it via ➕ **Add Channel**.\n"
+                        f"3. Open the task and tap ▶️ **Resume Task**."
+                    )
+                except Exception as notify_err:
+                    logger.warning(
+                        f"Job {tid}: failed to send unresolvable-channel "
+                        f"notification: {notify_err}"
+                    )
 
-            # FIX 1: use _warm_peer_in_client instead of broken inject_peer
-            if access_hash:
-                await _warm_peer_in_client(user, target_int, access_hash)
-            else:
-                logger.info(f"Job {tid}: access_hash missing, scanning dialogs…")
+            async def _refresh_peer_or_pause() -> bool:
+                nonlocal access_hash
                 access_hash = await warm_peer_and_get_hash(
                     user, fresh["owner_id"], target_int
                 )
                 if not access_hash:
-                    logger.error(
-                        f"Job {tid}: cannot resolve channel {fresh['chat_id']} — "
-                        "user must re-add it"
+                    await _pause_unreachable_channel()
+                    return False
+                warmed_now = await _warm_peer_in_client(user, target_int, access_hash)
+                if not warmed_now:
+                    logger.warning(
+                        f"Job {tid}: refreshed access_hash still failed for {fresh['chat_id']}"
                     )
-                    # ── FIX 16: notify user + auto-pause on unresolvable channel ──
-                    # Previously this just returned silently. The task would retry
-                    # on every interval, log the same error each time, and the user
-                    # had no idea anything was wrong until they checked Railway logs.
-                    # Fix: pause the task immediately so it stops firing, then send
-                    # the user a clear Telegram notification with remediation steps.
-                    try:
-                        await set_task_paused(tid, True)
-                        if scheduler:
-                            try:
-                                scheduler.pause_job(tid)
-                            except Exception:
-                                pass
-                        pool_n = await get_db()
-                        ch_row = await pool_n.fetchrow(
-                            "SELECT title FROM userbot_channels "
-                            "WHERE user_id=$1 AND channel_id=$2",
-                            fresh["owner_id"], fresh["chat_id"]
-                        )
-                        ch_label = (ch_row["title"] if ch_row else None) or fresh["chat_id"]
-                        await app.send_message(
-                            fresh["owner_id"],
-                            f"⚠️ **Scheduled post paused**\n\n"
-                            f"Task `{tid}` could not reach channel **{ch_label}** "
-                            f"(`{fresh['chat_id']}`) — your account is no longer "
-                            f"recognised as an admin there.\n\n"
-                            f"This task has been **paused automatically** to stop "
-                            f"repeated failures.\n\n"
-                            f"**To fix:**\n"
-                            f"1. Confirm your account is still an admin of that channel.\n"
-                            f"2. Re-add it via ➕ **Add Channel**.\n"
-                            f"3. Open the task and tap ▶️ **Resume Task**."
-                        )
-                    except Exception as notify_err:
-                        logger.warning(
-                            f"Job {tid}: failed to send unresolvable-channel "
-                            f"notification: {notify_err}"
-                        )
+                    await _pause_unreachable_channel()
+                    return False
+                return True
+
+            target_int  = int(fresh["chat_id"])
+            access_hash = await get_channel_access_hash(fresh["owner_id"], fresh["chat_id"])
+
+            # FIX 1: use _warm_peer_in_client instead of broken inject_peer
+            warmed = False
+            if access_hash:
+                warmed = await _warm_peer_in_client(user, target_int, access_hash)
+                if not warmed:
+                    logger.warning(
+                        f"Job {tid}: cached access_hash failed for {fresh['chat_id']} — "
+                        "refreshing from dialogs"
+                    )
+                    access_hash = 0
+
+            if not access_hash:
+                logger.info(f"Job {tid}: access_hash missing, scanning dialogs…")
+                if not await _refresh_peer_or_pause():
                     return
-                await _warm_peer_in_client(user, target_int, access_hash)
 
             caption  = fresh["content_text"]
             ents     = deserialize_entities(fresh["entities"])
@@ -3600,6 +3638,20 @@ async def _run_job(tid: str):
 
             try:
                 await _send()
+            except errors.ChannelInvalid:
+                logger.warning(
+                    f"Job {tid}: send hit CHANNEL_INVALID — refreshing peer and retrying once"
+                )
+                if not await _refresh_peer_or_pause():
+                    return
+                try:
+                    await _send()
+                except errors.ChannelInvalid:
+                    logger.warning(
+                        f"Job {tid}: send still hits CHANNEL_INVALID after peer refresh"
+                    )
+                    await _pause_unreachable_channel()
+                    return
             except (errors.FileIdInvalid, errors.MediaEmpty, errors.FileReferenceExpired) as _send_err:
                 logger.warning(f"Job {tid}: {ct} send failed ({type(_send_err).__name__}) — attempting recovery")
                 media = None

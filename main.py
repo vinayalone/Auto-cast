@@ -51,6 +51,9 @@ BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 DEFAULT_TZ = pytz.utc
+CLIENT_DEVICE_MODEL = "AutoCast"
+CLIENT_SYSTEM_VERSION = "Railway"
+CLIENT_APP_VERSION = "2.0"
 
 app = Client(
     "autocast_v2",
@@ -202,6 +205,53 @@ async def set_user_tz(uid: int, tz_str: str):
 def now_in(tz: pytz.BaseTzInfo) -> datetime.datetime:
     return datetime.datetime.now(tz)
 
+def _build_user_client(*, session_string: str | None = None) -> Client:
+    """
+    Build a short-lived user-session client for utility work only.
+
+    These clients should never consume Telegram updates. Leaving updates enabled
+    spawns background handle_updates tasks that produce noisy
+    updates.GetDifference / ConnectionResetError crashes when the client is used
+    for one-off exports, imports, or scheduled sends and then torn down.
+    """
+    return Client(
+        ":memory:",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        session_string=session_string,
+        in_memory=True,
+        no_updates=True,
+        skip_updates=True,
+        workers=1,
+        max_concurrent_transmissions=1,
+        device_model=CLIENT_DEVICE_MODEL,
+        system_version=CLIENT_SYSTEM_VERSION,
+        app_version=CLIENT_APP_VERSION,
+    )
+
+def _build_login_client() -> Client:
+    return Client(
+        ":memory:",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        in_memory=True,
+        no_updates=True,
+        skip_updates=True,
+        workers=1,
+        max_concurrent_transmissions=1,
+        device_model=CLIENT_DEVICE_MODEL,
+        system_version=CLIENT_SYSTEM_VERSION,
+        app_version=CLIENT_APP_VERSION,
+    )
+
+def _parse_interval_minutes(interval_str: str | None) -> int | None:
+    if not interval_str:
+        return None
+    try:
+        return int(str(interval_str).split("=")[1])
+    except Exception:
+        return None
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  DATABASE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -277,6 +327,9 @@ async def init_db():
             "ALTER TABLE userbot_settings  ADD COLUMN IF NOT EXISTS timezone      TEXT    DEFAULT 'UTC'",
             "ALTER TABLE userbot_settings  ADD COLUMN IF NOT EXISTS engine_paused BOOLEAN DEFAULT FALSE",
             "ALTER TABLE userbot_channels  ADD COLUMN IF NOT EXISTS access_hash BIGINT DEFAULT 0",
+            "CREATE INDEX IF NOT EXISTS idx_userbot_tasks_owner_id ON userbot_tasks_v11 (owner_id)",
+            "CREATE INDEX IF NOT EXISTS idx_userbot_tasks_owner_chat ON userbot_tasks_v11 (owner_id, chat_id)",
+            "CREATE INDEX IF NOT EXISTS idx_userbot_tasks_owner_paused ON userbot_tasks_v11 (owner_id, is_paused)",
         ]:
             try:
                 await conn.execute(sql)
@@ -665,12 +718,7 @@ async def delete_all_user_data(user_id):
     if session_str:
         try:
             async def _logout():
-                async with Client(
-                    ":memory:", api_id=API_ID, api_hash=API_HASH,
-                    session_string=session_str,
-                    device_model="AutoCast", system_version="Railway",
-                    app_version="2.0"
-                ) as u:
+                async with _build_user_client(session_string=session_str) as u:
                     await u.log_out()
 
             # FIX 5: Don't raise on second timeout — just warn and continue.
@@ -741,11 +789,7 @@ async def delete_sent_message(owner_id, chat_id, message_id):
             return
         access_hash = await get_channel_access_hash(owner_id, str(chat_id))
         chat_id_int = int(chat_id)
-        async with Client(
-            ":memory:", api_id=API_ID, api_hash=API_HASH,
-            session_string=session,
-            device_model="AutoCast", system_version="Railway", app_version="2.0"
-        ) as user:
+        async with _build_user_client(session_string=session) as user:
             # FIX 1: use _warm_peer_in_client instead of the broken inject_peer
             await _warm_peer_in_client(user, chat_id_int, access_hash)
             await user.delete_messages(chat_id_int, message_id)
@@ -819,14 +863,20 @@ def _next_future_run(original_iso: str, interval_str: str | None,
     if not interval_str:
         return now_utc + datetime.timedelta(minutes=5)
 
-    try:
-        mins = int(interval_str.split("=")[1])
-        delta = datetime.timedelta(minutes=mins)
-        elapsed = now_utc - dt
-        periods_missed = int(elapsed.total_seconds() / delta.total_seconds()) + 1
-        return dt + delta * periods_missed
-    except Exception:
+    mins = _parse_interval_minutes(interval_str)
+    if not mins:
         return now_utc + datetime.timedelta(minutes=5)
+    delta = datetime.timedelta(minutes=mins)
+    elapsed = now_utc - dt
+    periods_missed = int(elapsed.total_seconds() / delta.total_seconds()) + 1
+    return dt + delta * periods_missed
+
+def _next_run_iso(original_iso: str, interval_str: str | None,
+                  now_utc: datetime.datetime | None = None) -> str | None:
+    if not interval_str:
+        return None
+    now_utc = now_utc or datetime.datetime.now(pytz.utc)
+    return _next_future_run(original_iso, interval_str, now_utc).isoformat()
 
 
 def _extract_media_file_id(msg, content_type: str) -> str | None:
@@ -862,7 +912,7 @@ async def _download_media_bytes(file_id: str, user_client=None) -> bytes | None:
       1. Try the user's own session client first — it runs on an isolated TCP
          connection that is NOT shared with job clients, so upload.GetFile
          congestion on the bot's main connection doesn't affect it.
-      2. Fall back to the bot client (app) with 3 attempts + exponential backoff
+      2. Fall back to the bot client (app) with 5 attempts + exponential backoff
          so transient congestion is retried rather than silently dropped.
     """
     fid_short = file_id[:20] + "…"
@@ -871,7 +921,7 @@ async def _download_media_bytes(file_id: str, user_client=None) -> bytes | None:
     if user_client is not None:
         try:
             buf = await asyncio.wait_for(
-                user_client.download_media(file_id, in_memory=True), timeout=60.0
+                user_client.download_media(file_id, in_memory=True), timeout=90.0
             )
             if buf:
                 raw = bytes(buf.getbuffer())
@@ -889,14 +939,14 @@ async def _download_media_bytes(file_id: str, user_client=None) -> bytes | None:
             logger.warning(f"Media {fid_short}: user-client download failed ({e}) — falling back to bot client")
 
     # ── Tier 2: bot client with retries ────────────────────────────────────
-    for attempt in range(1, 4):          # attempts 1, 2, 3
-        delay = 0 if attempt == 1 else 10 * (attempt - 1)   # 0s, 10s, 20s
+    for attempt in range(1, 6):          # attempts 1..5
+        delay = 0 if attempt == 1 else 5 * (2 ** (attempt - 2))   # 0s, 5s, 10s, 20s, 40s
         if delay:
-            logger.info(f"Media {fid_short}: retrying bot-client download in {delay}s (attempt {attempt}/3)…")
+            logger.info(f"Media {fid_short}: retrying bot-client download in {delay}s (attempt {attempt}/5)…")
             await asyncio.sleep(delay)
         try:
             buf = await asyncio.wait_for(
-                app.download_media(file_id, in_memory=True), timeout=45.0
+                app.download_media(file_id, in_memory=True), timeout=90.0
             )
             if buf:
                 raw = bytes(buf.getbuffer())
@@ -909,9 +959,9 @@ async def _download_media_bytes(file_id: str, user_client=None) -> bytes | None:
             logger.warning(f"Media {fid_short}: FILE_REFERENCE_EXPIRED on bot client — no further retries")
             return None
         except asyncio.TimeoutError:
-            logger.warning(f"Media {fid_short}: bot-client download timed out (attempt {attempt}/3)")
+            logger.warning(f"Media {fid_short}: bot-client download timed out (attempt {attempt}/5)")
         except Exception as e:
-            logger.warning(f"Media {fid_short}: bot-client download error (attempt {attempt}/3): {e}")
+            logger.warning(f"Media {fid_short}: bot-client download error (attempt {attempt}/5): {e}")
 
     logger.error(f"Media {fid_short}: all download attempts exhausted — task will be exported WITHOUT media bytes")
     return None
@@ -919,7 +969,7 @@ async def _download_media_bytes(file_id: str, user_client=None) -> bytes | None:
 
 async def _upload_media_bytes(user_client, ct: str,
                                raw: bytes, caption: str | None,
-                               ents) -> str | None:
+                               ents) -> dict | None:
     """
     FIX 3: Use "me" (Saved Messages) as the staging target instead of target_dummy
     (which was the user's Telegram ID — often unresolvable in a fresh in-memory session).
@@ -939,27 +989,41 @@ async def _upload_media_bytes(user_client, ct: str,
         # "me" always resolves to Saved Messages — no peer resolution needed
         target = "me"
 
+        caption_kwargs = {}
+        if ct in ("photo", "video", "animation", "audio", "document") and ents:
+            caption_kwargs["caption_entities"] = deserialize_entities(ents)
+
         if ct == "photo":
-            sent = await user_client.send_photo(target, buf, caption=caption or "")
-            fid  = sent.photo.file_id
+            sent = await user_client.send_photo(
+                target, buf, caption=caption or "", **caption_kwargs
+            )
+            fid = sent.photo.file_id
         elif ct == "video":
-            sent = await user_client.send_video(target, buf, caption=caption or "")
-            fid  = sent.video.file_id
+            sent = await user_client.send_video(
+                target, buf, caption=caption or "", **caption_kwargs
+            )
+            fid = sent.video.file_id
         elif ct == "animation":
-            sent = await user_client.send_animation(target, buf, caption=caption or "")
-            fid  = sent.animation.file_id
+            sent = await user_client.send_animation(
+                target, buf, caption=caption or "", **caption_kwargs
+            )
+            fid = sent.animation.file_id
         elif ct == "audio":
-            sent = await user_client.send_audio(target, buf, caption=caption or "")
-            fid  = sent.audio.file_id
+            sent = await user_client.send_audio(
+                target, buf, caption=caption or "", **caption_kwargs
+            )
+            fid = sent.audio.file_id
         elif ct == "voice":
             sent = await user_client.send_voice(target, buf)
-            fid  = sent.voice.file_id
+            fid = sent.voice.file_id
         elif ct == "sticker":
             sent = await user_client.send_sticker(target, buf)
-            fid  = sent.sticker.file_id
+            fid = sent.sticker.file_id
         else:
-            sent = await user_client.send_document(target, buf, caption=caption or "")
-            fid  = sent.document.file_id
+            sent = await user_client.send_document(
+                target, buf, caption=caption or "", **caption_kwargs
+            )
+            fid = sent.document.file_id
         # ── FIX 27: Do NOT delete the staging message ─────────────────────────
         # Previously we deleted it immediately after getting file_id.  That made
         # src_msg_id point to a deleted (empty) message, so all future attempts to
@@ -969,9 +1033,63 @@ async def _upload_media_bytes(user_client, ct: str,
         # Keeping the message in Saved Messages means the file reference can always
         # be refreshed cheaply with a single get_messages() call.
         logger.debug(f"_upload_media_bytes ct={ct}: staging msg {sent.id} kept in Saved Messages for reference refresh")
-        return fid
+        return {
+            "file_id": fid,
+            "src_chat_id": int(getattr(sent.chat, "id", 0) or 0),
+            "src_msg_id": int(sent.id),
+        }
     except Exception as e:
         logger.warning(f"_upload_media_bytes ct={ct}: {e}")
+        return None
+
+async def _stage_bot_message_media(uid: int, message: Message,
+                                   content_type: str,
+                                   content_text: str | None,
+                                   entities_json: str | None) -> dict | None:
+    """
+    Stage newly captured media into the user's Saved Messages so every task keeps
+    a durable, user-accessible source message for future file-reference refreshes.
+    """
+    if content_type in ("text", "poll"):
+        return None
+
+    session = await get_session(uid)
+    file_id = _extract_file_id(message)
+    if not session or not file_id:
+        return None
+
+    raw = None
+    for source in (file_id, message):
+        try:
+            buf = await asyncio.wait_for(
+                app.download_media(source, in_memory=True), timeout=90.0
+            )
+            if buf:
+                raw = bytes(buf.getbuffer())
+                break
+        except errors.FileReferenceExpired:
+            continue
+        except asyncio.TimeoutError:
+            logger.warning(f"Media staging timed out uid={uid} ct={content_type}")
+        except Exception as e:
+            logger.warning(f"Media staging download failed uid={uid} ct={content_type}: {e}")
+
+    if raw is None:
+        return None
+
+    try:
+        async with _build_user_client(session_string=session) as user_client:
+            staged = await _upload_media_bytes(
+                user_client, content_type, raw, content_text, entities_json
+            )
+            if staged:
+                logger.info(
+                    f"Media staged uid={uid} ct={content_type} "
+                    f"src={staged['src_chat_id']}/{staged['src_msg_id']}"
+                )
+            return staged
+    except Exception as e:
+        logger.warning(f"Media staging upload failed uid={uid} ct={content_type}: {e}")
         return None
 
 
@@ -1008,11 +1126,7 @@ async def export_user_config(uid: int) -> dict:
     try:
         session = await get_session(uid)
         if session:
-            export_user_client = Client(
-                ":memory:", api_id=API_ID, api_hash=API_HASH,
-                session_string=session, device_model="AutoCast",
-                system_version="Railway", app_version="2.0",
-            )
+            export_user_client = _build_user_client(session_string=session)
             await export_user_client.start()
             logger.info(f"Export uid={uid}: user-session client started for media downloads")
     except Exception as e:
@@ -1158,7 +1272,7 @@ async def import_user_config(uid: int, data: dict,
     which may not work cross-account but degrades gracefully).
     """
     if data.get("version") not in (1, 2, 3, 4):
-        return 0, [f"Unsupported export version '{data.get('version')}'. Expected 3 or 4."]
+        return 0, [f"Unsupported export version '{data.get('version')}'. Expected 1, 2, 3, or 4."]
 
     async def _progress(msg: str):
         if progress_cb:
@@ -1188,11 +1302,7 @@ async def import_user_config(uid: int, data: dict,
         )
     user_client_ctx = None
     if session:
-        user_client_ctx = Client(
-            ":memory:", api_id=API_ID, api_hash=API_HASH,
-            session_string=session,
-            device_model="AutoCast", system_version="Railway", app_version="2.0"
-        )
+        user_client_ctx = _build_user_client(session_string=session)
         await user_client_ctx.start()
 
     try:
@@ -1285,6 +1395,8 @@ async def import_user_config(uid: int, data: dict,
 
                 ct  = t.get("content_type", "text")
                 fid = t.get("file_id")
+                src_chat_id = int(t.get("src_chat_id", 0) or 0)
+                src_msg_id = int(t.get("src_msg_id", 0) or 0)
 
                 if ct not in ("text", "poll") and user_client_ctx:
                     raw_b64 = t.get("media_bytes")
@@ -1292,12 +1404,14 @@ async def import_user_config(uid: int, data: dict,
                         try:
                             raw = base64.b64decode(raw_b64)
                             # FIX 3: pass no target_dummy — _upload_media_bytes uses "me"
-                            new_fid = await _upload_media_bytes(
+                            staged = await _upload_media_bytes(
                                 user_client_ctx, ct,
-                                raw, t.get("content_text"), None
+                                raw, t.get("content_text"), t.get("entities")
                             )
-                            if new_fid:
-                                fid = new_fid
+                            if staged:
+                                fid = staged["file_id"]
+                                src_chat_id = int(staged.get("src_chat_id") or 0)
+                                src_msg_id = int(staged.get("src_msg_id") or 0)
                             else:
                                 errs.append(
                                     f"Task #{i+1}: media re-upload failed — "
@@ -1329,8 +1443,8 @@ async def import_user_config(uid: int, data: dict,
                     "last_msg_id":        None,
                     "auto_delete_offset": int(t.get("auto_delete_offset", 0)),
                     "reply_target":       reply_target_val,
-                    "src_chat_id":        int(t.get("src_chat_id", 0) or 0),
-                    "src_msg_id":         int(t.get("src_msg_id", 0) or 0),
+                    "src_chat_id":        src_chat_id,
+                    "src_msg_id":         src_msg_id,
                 }
                 await save_task(task_data)
                 add_scheduler_job(task_data)
@@ -2033,13 +2147,9 @@ async def _handle_callback(c, q, uid, d):
                 st_dt = _ensure_utc(datetime.datetime.fromisoformat(task["start_time"]))
                 now_u = datetime.datetime.now(pytz.utc)
                 if st_dt < now_u and task.get("repeat_interval"):
-                    mins  = int(task["repeat_interval"].split("=")[1])
-                    delta = datetime.timedelta(minutes=mins)
-                    # Advance by however many full intervals have elapsed + 1
-                    elapsed  = now_u - st_dt
-                    periods  = int(elapsed.total_seconds() / delta.total_seconds()) + 1
-                    new_dt   = st_dt + delta * periods
-                    new_iso  = new_dt.isoformat()
+                    new_iso = _next_run_iso(task["start_time"], task["repeat_interval"], now_u)
+                    if not new_iso:
+                        raise ValueError("Could not compute next run time")
                     await update_next_run(tid, new_iso)
                     task["start_time"] = new_iso
                     logger.info(
@@ -2102,12 +2212,11 @@ async def _handle_callback(c, q, uid, d):
                         datetime.datetime.fromisoformat(task_d["start_time"])
                     )
                     if st_dt < now_u and task_d.get("repeat_interval"):
-                        mins  = int(task_d["repeat_interval"].split("=")[1])
-                        delta = datetime.timedelta(minutes=mins)
-                        elapsed = now_u - st_dt
-                        periods = int(elapsed.total_seconds() / delta.total_seconds()) + 1
-                        new_dt  = st_dt + delta * periods
-                        new_iso = new_dt.isoformat()
+                        new_iso = _next_run_iso(
+                            task_d["start_time"], task_d["repeat_interval"], now_u
+                        )
+                        if not new_iso:
+                            raise ValueError("Could not compute next run time")
                         await update_next_run(task_d["task_id"], new_iso)
                         task_d["start_time"] = new_iso
                         logger.info(
@@ -2193,6 +2302,39 @@ async def _handle_callback(c, q, uid, d):
                         break
                     except Exception:
                         pass
+            if not sent_media and task.get("file_id"):
+                session = await get_session(uid)
+                if session:
+                    try:
+                        async with _build_user_client(session_string=session) as user_client:
+                            media = await asyncio.wait_for(
+                                user_client.download_media(task["file_id"], in_memory=True),
+                                timeout=60.0
+                            )
+                        if media:
+                            ents = deserialize_entities(task.get("entities"))
+                            cap = task.get("content_text") or None
+                            if ct == "photo":
+                                await app.send_photo(uid, media, caption=cap, caption_entities=ents)
+                            elif ct == "video":
+                                await app.send_video(uid, media, caption=cap, caption_entities=ents)
+                            elif ct == "animation":
+                                await app.send_animation(uid, media, caption=cap, caption_entities=ents)
+                            elif ct == "document":
+                                media.name = "preview.bin"
+                                await app.send_document(uid, media, caption=cap, caption_entities=ents)
+                            elif ct == "audio":
+                                media.name = "preview.mp3"
+                                await app.send_audio(uid, media, caption=cap, caption_entities=ents)
+                            elif ct == "voice":
+                                media.name = "preview.ogg"
+                                await app.send_voice(uid, media, caption=cap)
+                            elif ct == "sticker":
+                                media.name = "preview.webp"
+                                await app.send_sticker(uid, media)
+                            sent_media = True
+                    except Exception as e:
+                        logger.warning(f"Preview fallback failed for {tid}: {e}")
             if not sent_media:
                 cap = task.get("content_text") or ""
                 await app.send_message(
@@ -2626,11 +2768,7 @@ async def handle_import_file(c, m, uid):
     session = await get_session(uid)
     if session:
         try:
-            async with Client(
-                ":memory:", api_id=API_ID, api_hash=API_HASH,
-                session_string=session,
-                device_model="AutoCast", system_version="Railway", app_version="2.0"
-            ) as _uc:
+            async with _build_user_client(session_string=session) as _uc:
                 buf = await asyncio.wait_for(
                     _uc.download_media(file_id, in_memory=True), timeout=90.0
                 )
@@ -2726,10 +2864,7 @@ async def _handle_login(c, m, uid, text):
     if st["step"] == "waiting_phone":
         wait = await m.reply("⏳ Connecting to Telegram… please wait.")
         try:
-            tmp = Client(
-                ":memory:", api_id=API_ID, api_hash=API_HASH,
-                device_model="AutoCast", system_version="Railway", app_version="2.0"
-            )
+            tmp = _build_login_client()
             await tmp.connect()
             sent_code = await tmp.send_code(text)
             st.update({
@@ -2824,11 +2959,7 @@ async def handle_forward_add(c, m, uid):
 
     access_hash = 0
     try:
-        async with Client(
-            ":memory:", api_id=API_ID, api_hash=API_HASH,
-            session_string=session,
-            device_model="AutoCast", system_version="Railway", app_version="2.0"
-        ) as user_client:
+        async with _build_user_client(session_string=session) as user_client:
             access_hash = await warm_peer_and_get_hash(user_client, uid, cid)
             try:
                 chat  = await user_client.get_chat(cid)
@@ -2866,11 +2997,7 @@ async def handle_channel_id_input(c, m, uid, text):
     title       = str(channel_id)
     access_hash = 0
     try:
-        async with Client(
-            ":memory:", api_id=API_ID, api_hash=API_HASH,
-            session_string=session,
-            device_model="AutoCast", system_version="Railway", app_version="2.0"
-        ) as user_client:
+        async with _build_user_client(session_string=session) as user_client:
             access_hash = await warm_peer_and_get_hash(user_client, uid, channel_id)
             if not access_hash:
                 await m.reply(
@@ -2920,10 +3047,18 @@ async def process_content_message(c, m, uid):
     st["input_msg_id"] = m.id
     if m.forward_from_chat and m.forward_from_message_id:
         st["src_chat_id"] = m.forward_from_chat.id
-        st["src_msg_id"]  = m.forward_from_message_id
+        st["src_msg_id"] = m.forward_from_message_id
     else:
         st["src_chat_id"] = m.chat.id
-        st["src_msg_id"]  = m.id
+        st["src_msg_id"] = m.id
+    if m.media:
+        staged = await _stage_bot_message_media(
+            uid, m, st["content_type"], st["content_text"], st["entities"]
+        )
+        if staged:
+            st["file_id"] = staged["file_id"]
+            st["src_chat_id"] = staged["src_chat_id"]
+            st["src_msg_id"] = staged["src_msg_id"]
     st["reply_to_channel_msg_id"] = None
     if m.reply_to_message:
         fwd_msg_id = getattr(m.reply_to_message, "forward_from_message_id", None)
@@ -2950,6 +3085,14 @@ async def process_broadcast_content_message(c, m, uid):
         "delete_old":         True,
         "auto_delete_offset": 0,
     }
+    if m.media:
+        staged = await _stage_bot_message_media(
+            uid, m, post["content_type"], post["content_text"], post["entities"]
+        )
+        if staged:
+            post["file_id"] = staged["file_id"]
+            post["src_chat_id"] = staged["src_chat_id"]
+            post["src_msg_id"] = staged["src_msg_id"]
     if m.reply_to_message:
         post["reply_ref_id"] = m.reply_to_message.id
     queue.append(post)
@@ -3002,6 +3145,14 @@ async def process_content_edit_message(c, m, uid):
     st["entities"]     = serialize_entities(m.caption_entities or m.entities)
     st["src_chat_id"]  = m.chat.id
     st["src_msg_id"]   = m.id
+    if m.media:
+        staged = await _stage_bot_message_media(
+            uid, m, st["content_type"], st["content_text"], st["entities"]
+        )
+        if staged:
+            st["file_id"] = staged["file_id"]
+            st["src_chat_id"] = staged["src_chat_id"]
+            st["src_msg_id"] = staged["src_msg_id"]
     st["step"] = None
 
     task = await get_single_task(tid)
@@ -3194,7 +3345,9 @@ def add_scheduler_job(t):
                     pass
 
     if t["repeat_interval"]:
-        mins = int(t["repeat_interval"].split("=")[1])
+        mins = _parse_interval_minutes(t["repeat_interval"])
+        if not mins:
+            raise ValueError(f"Invalid repeat interval for {tid}: {t['repeat_interval']}")
         scheduler.add_job(
             job_func,
             IntervalTrigger(start_date=dt, timezone=pytz.utc, minutes=mins),
@@ -3227,10 +3380,10 @@ async def _run_job(tid: str):
     next_iso = None
     if fresh["repeat_interval"]:
         try:
-            mins = int(fresh["repeat_interval"].split("=")[1])
-            next_iso = (
-                datetime.datetime.now(pytz.utc) + datetime.timedelta(minutes=mins)
-            ).isoformat()
+            next_iso = _next_run_iso(
+                fresh["start_time"], fresh["repeat_interval"],
+                datetime.datetime.now(pytz.utc)
+            )
         except Exception as e:
             logger.error(f"Next-run calc error for {tid}: {e}")
 
@@ -3258,11 +3411,7 @@ async def _run_job(tid: str):
 
     sent = None
     try:
-        async with Client(
-            ":memory:", api_id=API_ID, api_hash=API_HASH,
-            session_string=session,
-            device_model="AutoCast", system_version="Railway", app_version="2.0"
-        ) as user:
+        async with _build_user_client(session_string=session) as user:
             target_int  = int(fresh["chat_id"])
             access_hash = await get_channel_access_hash(fresh["owner_id"], fresh["chat_id"])
 

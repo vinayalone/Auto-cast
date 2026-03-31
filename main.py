@@ -928,6 +928,72 @@ def _extract_media_file_id(msg, content_type: str) -> str | None:
             return getattr(media, "file_id", None)
     return None
 
+async def _fetch_task_media_message(user_client, owner_id: int,
+                                    chat_id: int, msg_id: int,
+                                    log_prefix: str) -> Message | None:
+    if not chat_id or not msg_id:
+        return None
+    try:
+        chat_id = int(chat_id)
+        msg_id = int(msg_id)
+    except Exception:
+        return None
+
+    if chat_id < 0:
+        access_hash = await get_channel_access_hash(owner_id, str(chat_id))
+        warmed = await _warm_peer_in_client(user_client, chat_id, access_hash)
+        if not warmed:
+            access_hash = await warm_peer_and_get_hash(user_client, owner_id, chat_id)
+            warmed = bool(access_hash) and await _warm_peer_in_client(user_client, chat_id, access_hash)
+        if not warmed:
+            logger.warning(f"{log_prefix}: could not resolve peer {chat_id}")
+            return None
+
+    try:
+        return await asyncio.wait_for(
+            user_client.get_messages(chat_id, msg_id), timeout=15.0
+        )
+    except Exception as e:
+        logger.warning(f"{log_prefix}: message fetch failed ({e})")
+        return None
+
+async def _resolve_task_media_file_id(user_client, owner_id: int,
+                                      task: dict,
+                                      log_prefix: str) -> tuple[str | None, str]:
+    ct = task.get("content_type")
+    if ct in ("text", "poll"):
+        return None, "n/a"
+
+    src_cid = int(task.get("src_chat_id") or 0)
+    src_mid = int(task.get("src_msg_id") or 0)
+    if src_cid and src_mid:
+        src_msg = await _fetch_task_media_message(
+            user_client, owner_id, src_cid, src_mid, f"{log_prefix}: src"
+        )
+        if src_msg:
+            fresh_fid = _extract_media_file_id(src_msg, ct)
+            if fresh_fid:
+                return fresh_fid, "src"
+            logger.warning(
+                f"{log_prefix}: source msg {src_cid}/{src_mid} has no {ct}"
+            )
+
+    last_mid = int(task.get("last_msg_id") or 0)
+    if last_mid:
+        last_msg = await _fetch_task_media_message(
+            user_client, owner_id, int(task.get("chat_id") or 0), last_mid,
+            f"{log_prefix}: last_msg"
+        )
+        if last_msg:
+            fresh_fid = _extract_media_file_id(last_msg, ct)
+            if fresh_fid:
+                return fresh_fid, "last_msg"
+            logger.warning(
+                f"{log_prefix}: last sent msg {last_mid} has no {ct}"
+            )
+
+    return task.get("file_id"), "stored"
+
 
 async def _download_media_bytes(file_id: str, user_client=None) -> bytes | None:
     """
@@ -1196,50 +1262,21 @@ async def export_user_config(uid: int) -> dict:
                 }
                 if t["content_type"] not in ("text", "poll") and t.get("file_id"):
                     download_fid = t["file_id"]
+                    log_prefix = (
+                        f"Export uid={uid}: task {t.get('task_id','?')} "
+                        f"ct={t['content_type']} src={t.get('src_chat_id') or 0}/"
+                        f"{t.get('src_msg_id') or 0} last_msg={int(t.get('last_msg_id') or 0)}"
+                    )
+                    logger.info(log_prefix)
 
-                    # ── FIX 25: Refresh expired file reference via source message ──
-                    # Telegram file references expire.  Stored file_id values can be
-                    # months old, making them stale on export.  Prefetching the source
-                    # message gives us a guaranteed-fresh file_id and avoids the storm
-                    # of Pyrogram reconnects that FILE_REFERENCE_EXPIRED triggers.
-                    src_cid = t.get("src_chat_id") or 0
-                    src_mid = t.get("src_msg_id") or 0
-                    last_mid = int(t.get("last_msg_id") or 0)
-                    logger.info(f"Export uid={uid}: task {t.get('task_id','?')} ct={t['content_type']} src={src_cid}/{src_mid} last_msg={last_mid}")
-
-                    # ── Tier A: staging message in Saved Messages ─────────────────────
-                    if src_cid and src_mid and export_user_client:
-                        try:
-                            src_msg = await asyncio.wait_for(
-                                export_user_client.get_messages(int(src_cid), int(src_mid)),
-                                timeout=15.0,
+                    if export_user_client:
+                        download_fid, fid_source = await _resolve_task_media_file_id(
+                            export_user_client, uid, t, log_prefix
+                        )
+                        if download_fid and fid_source != "stored":
+                            logger.info(
+                                f"{log_prefix}: file_id refreshed from {fid_source}"
                             )
-                            fresh_fid = _extract_media_file_id(src_msg, t["content_type"])
-                            if fresh_fid:
-                                download_fid = fresh_fid
-                                logger.info(f"Export uid={uid}: task {t.get('task_id','?')}: file_id refreshed OK from Saved Messages msg {src_mid}")
-                            else:
-                                logger.warning(f"Export uid={uid}: task {t.get('task_id','?')}: Saved Messages msg {src_mid} has no {t['content_type']} (deleted before FIX 27) — trying last_msg fallback")
-                        except Exception as ref_err:
-                            logger.warning(f"Export uid={uid}: task {t.get('task_id','?')}: Saved Messages fetch FAILED ({ref_err}) — trying last_msg fallback")
-
-                    # ── Tier B: last sent message in target channel ───────────────────
-                    # For tasks created before FIX 27 (staging msg was deleted), fetch
-                    # from the last successfully sent message in the channel instead.
-                    if download_fid == t["file_id"] and last_mid and export_user_client:
-                        try:
-                            last_msg = await asyncio.wait_for(
-                                export_user_client.get_messages(int(t["chat_id"]), last_mid),
-                                timeout=15.0,
-                            )
-                            last_fid = _extract_media_file_id(last_msg, t["content_type"])
-                            if last_fid:
-                                download_fid = last_fid
-                                logger.info(f"Export uid={uid}: task {t.get('task_id','?')}: file_id refreshed from last sent msg {last_mid} in channel")
-                            else:
-                                logger.warning(f"Export uid={uid}: task {t.get('task_id','?')}: last sent msg {last_mid} has no {t['content_type']} — falling back to stored fid")
-                        except Exception as lme:
-                            logger.warning(f"Export uid={uid}: task {t.get('task_id','?')}: last_msg fetch FAILED ({lme}) — using stored fid")
 
                     raw = await _download_media_bytes(
                         download_fid, user_client=export_user_client
@@ -2316,56 +2353,44 @@ async def _handle_callback(c, q, uid, d):
             )
             await update_menu(q.message, summary, back_kb, uid)
             sent_media = False
-            for src_chat, src_msg in [
-                (task.get("src_chat_id"), task.get("src_msg_id")),
-                (int(task["chat_id"]) if task.get("last_msg_id") else None, task.get("last_msg_id")),
-            ]:
-                if src_chat and src_msg:
-                    src_chat = int(src_chat)
-                    src_msg = int(src_msg)
-                    # Saved Messages / self-chat sources belong to the user's session,
-                    # not the bot account, so bot-side copy_message is expected to fail.
-                    if src_chat == uid:
-                        continue
-                    try:
-                        await app.copy_message(uid, from_chat_id=src_chat, message_id=src_msg)
-                        sent_media = True
-                        break
-                    except Exception:
-                        pass
-            if not sent_media and task.get("file_id"):
-                session = await get_session(uid)
-                if session:
-                    try:
-                        async with _build_user_client(session_string=session) as user_client:
+            session = await get_session(uid)
+            if session:
+                try:
+                    async with _build_user_client(session_string=session) as user_client:
+                        preview_fid, preview_source = await _resolve_task_media_file_id(
+                            user_client, uid, task, f"Preview {tid}"
+                        )
+                        media = None
+                        if preview_fid:
                             media = await asyncio.wait_for(
-                                user_client.download_media(task["file_id"], in_memory=True),
+                                user_client.download_media(preview_fid, in_memory=True),
                                 timeout=60.0
                             )
-                        if media:
-                            ents = deserialize_entities(task.get("entities"))
-                            cap = task.get("content_text") or None
-                            if ct == "photo":
-                                await app.send_photo(uid, media, caption=cap, caption_entities=ents)
-                            elif ct == "video":
-                                await app.send_video(uid, media, caption=cap, caption_entities=ents)
-                            elif ct == "animation":
-                                await app.send_animation(uid, media, caption=cap, caption_entities=ents)
-                            elif ct == "document":
-                                media.name = "preview.bin"
-                                await app.send_document(uid, media, caption=cap, caption_entities=ents)
-                            elif ct == "audio":
-                                media.name = "preview.mp3"
-                                await app.send_audio(uid, media, caption=cap, caption_entities=ents)
-                            elif ct == "voice":
-                                media.name = "preview.ogg"
-                                await app.send_voice(uid, media, caption=cap)
-                            elif ct == "sticker":
-                                media.name = "preview.webp"
-                                await app.send_sticker(uid, media)
-                            sent_media = True
-                    except Exception as e:
-                        logger.warning(f"Preview fallback failed for {tid}: {e}")
+                    if media:
+                        ents = deserialize_entities(task.get("entities"))
+                        cap = task.get("content_text") or None
+                        if ct == "photo":
+                            await app.send_photo(uid, media, caption=cap, caption_entities=ents)
+                        elif ct == "video":
+                            await app.send_video(uid, media, caption=cap, caption_entities=ents)
+                        elif ct == "animation":
+                            await app.send_animation(uid, media, caption=cap, caption_entities=ents)
+                        elif ct == "document":
+                            media.name = "preview.bin"
+                            await app.send_document(uid, media, caption=cap, caption_entities=ents)
+                        elif ct == "audio":
+                            media.name = "preview.mp3"
+                            await app.send_audio(uid, media, caption=cap, caption_entities=ents)
+                        elif ct == "voice":
+                            media.name = "preview.ogg"
+                            await app.send_voice(uid, media, caption=cap)
+                        elif ct == "sticker":
+                            media.name = "preview.webp"
+                            await app.send_sticker(uid, media)
+                        sent_media = True
+                        logger.info(f"Preview {tid}: sent media via {preview_source}")
+                except Exception as e:
+                    logger.warning(f"Preview fallback failed for {tid}: {e}")
             if not sent_media:
                 cap = task.get("content_text") or ""
                 await app.send_message(

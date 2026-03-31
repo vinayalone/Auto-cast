@@ -4,6 +4,7 @@ import io
 import json
 import base64
 import hashlib
+import inspect
 import logging
 import asyncio
 import datetime
@@ -95,6 +96,7 @@ def _evict_stale():
 #  corrupt sessions — it now logs a clear warning instead of returning garbage.
 # ─────────────────────────────────────────────────────────────────────────────
 _fernet: Fernet | None = None
+_legacy_plaintext_sessions_logged: set[str] = set()
 
 def _init_encryption():
     global _fernet
@@ -141,10 +143,13 @@ def decrypt_session(s: str) -> str | None:
             )
             return None
         # Doesn't look like Fernet — treat as legacy plaintext session.
-        logger.info(
-            "decrypt_session: InvalidToken but value is not Fernet ciphertext — "
-            "treating as legacy plaintext session."
-        )
+        fp = hashlib.sha256(s.encode()).hexdigest()[:12]
+        if fp not in _legacy_plaintext_sessions_logged:
+            _legacy_plaintext_sessions_logged.add(fp)
+            logger.info(
+                "decrypt_session: InvalidToken but value is not Fernet ciphertext — "
+                "treating as legacy plaintext session."
+            )
         return s
     except Exception:
         return s
@@ -205,6 +210,11 @@ async def set_user_tz(uid: int, tz_str: str):
 def now_in(tz: pytz.BaseTzInfo) -> datetime.datetime:
     return datetime.datetime.now(tz)
 
+_CLIENT_INIT_PARAM_NAMES = set(inspect.signature(Client.__init__).parameters)
+
+def _client_compat_kwargs(**kwargs) -> dict:
+    return {k: v for k, v in kwargs.items() if k in _CLIENT_INIT_PARAM_NAMES}
+
 def _build_user_client(*, session_string: str | None = None) -> Client:
     """
     Build a short-lived user-session client for utility work only.
@@ -214,8 +224,7 @@ def _build_user_client(*, session_string: str | None = None) -> Client:
     updates.GetDifference / ConnectionResetError crashes when the client is used
     for one-off exports, imports, or scheduled sends and then torn down.
     """
-    return Client(
-        ":memory:",
+    kwargs = _client_compat_kwargs(
         api_id=API_ID,
         api_hash=API_HASH,
         session_string=session_string,
@@ -228,10 +237,10 @@ def _build_user_client(*, session_string: str | None = None) -> Client:
         system_version=CLIENT_SYSTEM_VERSION,
         app_version=CLIENT_APP_VERSION,
     )
+    return Client(":memory:", **kwargs)
 
 def _build_login_client() -> Client:
-    return Client(
-        ":memory:",
+    kwargs = _client_compat_kwargs(
         api_id=API_ID,
         api_hash=API_HASH,
         in_memory=True,
@@ -243,6 +252,7 @@ def _build_login_client() -> Client:
         system_version=CLIENT_SYSTEM_VERSION,
         app_version=CLIENT_APP_VERSION,
     )
+    return Client(":memory:", **kwargs)
 
 def _parse_interval_minutes(interval_str: str | None) -> int | None:
     if not interval_str:

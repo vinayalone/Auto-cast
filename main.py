@@ -978,8 +978,9 @@ async def pin_message_now(owner_id, chat_id, message_id, task_id=None, _attempt=
         wait_s = e.value + 2
         if scheduler and _attempt <= 3:
             retry_at = datetime.datetime.now(pytz.utc) + datetime.timedelta(seconds=wait_s)
+            # FIX ORDERING BUG: scheduling and DB persistence are independent
+            # so a DB error can never silently cancel the retry itself.
             try:
-                await add_pending_action(task_id, owner_id, chat_id, message_id, "pin", retry_at)
                 scheduler.add_job(
                     pin_message_now, "date", run_date=retry_at,
                     args=[owner_id, chat_id, message_id, task_id, _attempt + 1],
@@ -993,6 +994,10 @@ async def pin_message_now(owner_id, chat_id, message_id, task_id=None, _attempt=
                 )
             except Exception as sched_err:
                 logger.error(f"Pin: failed to schedule retry for msg {message_id}: {sched_err}")
+            try:
+                await add_pending_action(task_id, owner_id, chat_id, message_id, "pin", retry_at)
+            except Exception as e2:
+                logger.warning(f"Pin: could not persist retry (restart-safety only): {e2}")
         else:
             logger.warning(
                 f"Pin: giving up on msg {message_id} in {chat_id} after repeated FloodWait"
@@ -3765,12 +3770,12 @@ async def _run_job(tid: str):
                     # skipping. Now we schedule a standalone retry (persisted
                     # so it survives a restart too) instead of abandoning it.
                     logger.warning(f"Job {tid}: delete old failed ({e}) — scheduling retry")
+                    retry_at = datetime.datetime.now(pytz.utc) + datetime.timedelta(minutes=2)
+                    # FIX ORDERING BUG: same fix as the auto-delete-offset
+                    # block below -- scheduling and DB persistence are
+                    # independent so a DB error can't silently cancel the
+                    # actual retry.
                     try:
-                        retry_at = datetime.datetime.now(pytz.utc) + datetime.timedelta(minutes=2)
-                        await add_pending_action(
-                            tid, fresh["owner_id"], fresh["chat_id"],
-                            fresh["last_msg_id"], "delete", retry_at
-                        )
                         scheduler.add_job(
                             delete_sent_message, "date", run_date=retry_at,
                             args=[fresh["owner_id"], fresh["chat_id"], fresh["last_msg_id"]],
@@ -3779,6 +3784,13 @@ async def _run_job(tid: str):
                         )
                     except Exception as sched_err:
                         logger.error(f"Job {tid}: failed to schedule delete-old retry: {sched_err}")
+                    try:
+                        await add_pending_action(
+                            tid, fresh["owner_id"], fresh["chat_id"],
+                            fresh["last_msg_id"], "delete", retry_at
+                        )
+                    except Exception as e2:
+                        logger.warning(f"Job {tid}: could not persist delete-old retry (restart-safety only): {e2}")
 
             if fresh.get("reply_target"):
                 ref_val = str(fresh["reply_target"]).strip()
@@ -3996,15 +4008,18 @@ async def _run_job(tid: str):
 
                 off = fresh.get("auto_delete_offset", 0)
                 if off and off > 0:
+                    run_at = datetime.datetime.now(pytz.utc) + datetime.timedelta(minutes=off)
+                    # FIX ORDERING BUG: scheduling the APScheduler job is the
+                    # part that actually makes auto-delete happen. Persisting
+                    # to userbot_pending_actions is only a safety net for
+                    # restarts. These are now two independent try/excepts so
+                    # a DB hiccup (e.g. the table not existing yet on an old
+                    # deployment) can never prevent the real deletion from
+                    # being scheduled -- previously both calls shared one
+                    # try/except and a failure in the DB write silently
+                    # skipped scheduler.add_job entirely, disabling
+                    # auto-delete completely.
                     try:
-                        run_at = datetime.datetime.now(pytz.utc) + datetime.timedelta(minutes=off)
-                        # FIX AUTO-DELETE PERSIST: record the pending delete in
-                        # the DB (not just APScheduler's in-memory job store) so
-                        # a restart before run_at can't silently drop it — see
-                        # the pending-action reload in main().
-                        await add_pending_action(
-                            tid, fresh["owner_id"], fresh["chat_id"], sent.id, "delete", run_at
-                        )
                         scheduler.add_job(
                             delete_sent_message, "date", run_date=run_at,
                             args=[fresh["owner_id"], fresh["chat_id"], sent.id],
@@ -4013,6 +4028,12 @@ async def _run_job(tid: str):
                         )
                     except Exception as e:
                         logger.error(f"Job {tid}: auto-delete schedule failed: {e}")
+                    try:
+                        await add_pending_action(
+                            tid, fresh["owner_id"], fresh["chat_id"], sent.id, "delete", run_at
+                        )
+                    except Exception as e:
+                        logger.warning(f"Job {tid}: could not persist pending delete (restart-safety only): {e}")
 
                 if not fresh["repeat_interval"]:
                     await delete_task(tid)

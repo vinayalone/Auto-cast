@@ -1,6 +1,7 @@
 import os
 import sys
 import io
+import re
 import json
 import base64
 import hashlib
@@ -9,6 +10,7 @@ import logging
 import asyncio
 import datetime
 import time
+import unicodedata
 import pytz
 import asyncpg
 from cryptography.fernet import Fernet, InvalidToken
@@ -1014,6 +1016,148 @@ async def pin_message_now(owner_id, chat_id, message_id, task_id=None, _attempt=
                 pass
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  FIX GHOST REPOST: some channels run a second, independent bot that deletes
+#  AutoCast's post within moments of it landing and republishes a near-
+#  identical copy (commonly done to strip forward tags / keep content out of
+#  search). When that happens, the message AutoCast just sent no longer
+#  exists by the time it tries to pin it or remember it for "delete
+#  previous" -- pin has nothing left to pin, and the next cycle's delete
+#  targets an ID that's already gone while the copy actually visible in the
+#  channel is never touched by AutoCast at all.
+#
+#  _resolve_live_message polls right after sending: if the message is still
+#  there, nothing to do. If it's gone, it scans recent history for the
+#  message that replaced it (posted after ours, not from our own account,
+#  same content type/caption) and returns that message's ID instead so pin /
+#  delete-previous / auto-delete all keep acting on whatever is actually
+#  live in the channel.
+# ─────────────────────────────────────────────────────────────────────────────
+# NOTE: the invisible/zero-width/space-variant character classes below are
+# built from raw codepoints via chr() rather than typed as literal characters
+# in this source file. That's deliberate -- typing the actual invisible
+# glyphs into source code is fragile and easy to corrupt silently; codepoints
+# are unambiguous and always reconstruct the exact same characters at runtime.
+_ZERO_WIDTH_CODEPOINTS = [
+    0x200b, 0x200c, 0x200d, 0x2060, 0xfeff, 0x00ad,
+    0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e,
+    0xfe0e, 0xfe0f,
+]
+_SPACE_VARIANT_CODEPOINTS = (
+    [0x00a0, 0x1680] + list(range(0x2000, 0x200b)) +
+    [0x2028, 0x2029, 0x202f, 0x205f, 0x3000]
+)
+_ZERO_WIDTH_RE = re.compile(
+    "[" + "".join(chr(_c) for _c in _ZERO_WIDTH_CODEPOINTS) + "]"
+)
+_SPACE_VARIANTS_RE = re.compile(
+    "[" + "".join(chr(_c) for _c in _SPACE_VARIANT_CODEPOINTS) + "]"
+)
+
+# FIX HOMOGLYPH MATCHING: some "search-proofing" bots (e.g. channel bots with
+# a "Safe Mode") don't use invisible characters at all -- they swap a handful
+# of Latin letters for Cyrillic look-alikes that render identically to a
+# human (Cyrillic "а" U+0430 vs Latin "a" U+0061, etc). Unicode NFKC
+# normalization does NOT fold these -- they're genuinely different letters in
+# different scripts, not compatibility variants of the same character -- so
+# without an explicit translation table, our own plain-Latin caption would
+# never match a homoglyph-substituted repost even though a human reading both
+# side by side sees identical text. This table maps every Cyrillic look-alike
+# back to its Latin twin (both cases) before comparison.
+_HOMOGLYPH_PAIRS = [
+    (0x0430, 0x0061), (0x0441, 0x0063), (0x0435, 0x0065),
+    (0x043e, 0x006f), (0x0440, 0x0070), (0x0445, 0x0078),
+    (0x0410, 0x0041), (0x0421, 0x0043), (0x0415, 0x0045),
+    (0x041e, 0x004f), (0x0420, 0x0050), (0x0425, 0x0058),
+    (0x041c, 0x004d), (0x0422, 0x0054), (0x041a, 0x004b),
+]
+_HOMOGLYPH_TABLE = str.maketrans({chr(_cy): chr(_la) for _cy, _la in _HOMOGLYPH_PAIRS})
+
+def _normalize_text_for_match(text: str | None) -> str:
+    """
+    FIX INVISIBLE-CHAR / HOMOGLYPH MATCHING: some replacement bots
+    deliberately obscure text from Telegram's search index while it still
+    displays as completely normal text to a human reader -- either by
+    injecting zero-width/directional/exotic-space characters, or by
+    substituting a handful of Latin letters with visually identical Cyrillic
+    letters ("homoglyphs", e.g. a "Safe Mode" feature). Comparing raw strings
+    against a message treated either way never matches even though the
+    content is visually identical to a person looking at the channel.
+
+    This normalizes both sides the same way before comparison: Unicode
+    compatibility normalization (NFKC), folding known Cyrillic homoglyphs
+    back to their Latin twins, stripping invisible/zero-width/
+    directional-override characters entirely, collapsing exotic space
+    variants down to a plain space, and lower-casing -- so a "search-proofed"
+    copy of our own text still matches cleanly as the same content.
+    """
+    if not text:
+        return ""
+    t = unicodedata.normalize("NFKC", text)
+    t = t.translate(_HOMOGLYPH_TABLE)
+    t = _ZERO_WIDTH_RE.sub("", t)
+    t = _SPACE_VARIANTS_RE.sub(" ", t)
+    t = re.sub(r"\s+", " ", t).strip().lower()
+    return t
+
+def _content_signature_matches(msg: Message, caption: str | None, ct: str) -> bool:
+    try:
+        msg_ct = msg.media.value if msg.media else "text"
+    except Exception:
+        msg_ct = "text"
+    if ct in ("photo", "video", "animation", "document", "audio", "voice", "sticker"):
+        if msg_ct != ct:
+            return False
+        our_cap   = _normalize_text_for_match(caption)
+        their_cap = _normalize_text_for_match(msg.caption)
+        if our_cap and their_cap:
+            # Prefer an exact match on the normalized text -- this is the
+            # "must be the identical message" case. Substring containment is
+            # kept only as a fallback in case the replacement bot adds a
+            # small visible prefix/suffix (e.g. its own channel signature).
+            return our_cap == their_cap or our_cap in their_cap or their_cap in our_cap
+        return True  # same media type, nothing to compare captions on — close enough
+    else:  # text / poll
+        our_text   = _normalize_text_for_match(caption)
+        their_text = _normalize_text_for_match(msg.text)
+        if not our_text or not their_text:
+            return False
+        return our_text == their_text or our_text in their_text or their_text in our_text
+
+async def _resolve_live_message(user_client, target_int: int, sent: Message,
+                                 caption: str | None, ct: str, tid: str) -> int | None:
+    # FIX 5S CHECK: the primary check happens 5 seconds after sending -- long
+    # enough for a replacement bot to have already deleted-and-reposted in
+    # virtually every real-world case. Two more checks follow (+2s, +3s --
+    # i.e. 7s and 10s after sending) purely as a safety net for a slower
+    # replacement bot; the 5s check is the one that matters most.
+    for delay in (5.0, 2.0, 3.0):
+        await asyncio.sleep(delay)
+        try:
+            check = await user_client.get_messages(target_int, sent.id)
+            if check and not getattr(check, "empty", False):
+                return sent.id  # our own post is still there — no swap happened
+        except Exception:
+            pass
+        try:
+            async for msg in user_client.get_chat_history(target_int, limit=15):
+                if msg.id <= sent.id:
+                    break  # nothing newer than our own post yet
+                if getattr(msg.from_user, "is_self", False):
+                    continue  # that's us, keep looking
+                if _content_signature_matches(msg, caption, ct):
+                    logger.info(
+                        f"Job {tid}: original msg {sent.id} was replaced by "
+                        f"another bot/account — now tracking msg {msg.id} instead"
+                    )
+                    return msg.id
+        except Exception as e:
+            logger.warning(f"Job {tid}: replacement scan failed: {e}")
+    logger.warning(
+        f"Job {tid}: msg {sent.id} vanished and no replacement was found after polling"
+    )
+    return None
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  SERIALIZATION
 # ─────────────────────────────────────────────────────────────────────────────
 def serialize_entities(elist):
@@ -1042,7 +1186,6 @@ def deserialize_entities(json_str):
         return result
     except Exception:
         return None
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  EXPORT / IMPORT
 #
@@ -1741,7 +1884,6 @@ async def import_user_config(uid: int, data: dict,
                 pass
 
     return imported, errs
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  UI HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3996,44 +4138,65 @@ async def _run_job(tid: str):
 
             if sent:
                 logger.info(f"Job {tid}: sent msg {sent.id}")
-                if fresh["pin"]:
-                    # FIX PIN RELIABILITY: pinning now goes through
-                    # pin_message_now(), which retries automatically on
-                    # FloodWait instead of dropping the pin after a single
-                    # failed attempt (see definition above for why this was
-                    # the actual root cause of "pin is on but never happens").
-                    await pin_message_now(fresh["owner_id"], target_int, sent.id, task_id=tid)
 
-                await update_last_msg(tid, sent.id)
+                live_id = sent.id
+                needs_tracking = bool(
+                    fresh["pin"] or fresh["delete_old"] or (fresh.get("auto_delete_offset") or 0) > 0
+                )
+                if needs_tracking:
+                    # FIX GHOST REPOST: verify our post is still actually
+                    # there before pinning/tracking it. If another bot in the
+                    # channel deleted-and-reposted it, this finds the real
+                    # live message so pin/delete-old/auto-delete target it
+                    # instead of silently failing against a message that's
+                    # already gone.
+                    resolved = await _resolve_live_message(user, target_int, sent, caption, ct, tid)
+                    live_id = resolved
 
-                off = fresh.get("auto_delete_offset", 0)
-                if off and off > 0:
-                    run_at = datetime.datetime.now(pytz.utc) + datetime.timedelta(minutes=off)
-                    # FIX ORDERING BUG: scheduling the APScheduler job is the
-                    # part that actually makes auto-delete happen. Persisting
-                    # to userbot_pending_actions is only a safety net for
-                    # restarts. These are now two independent try/excepts so
-                    # a DB hiccup (e.g. the table not existing yet on an old
-                    # deployment) can never prevent the real deletion from
-                    # being scheduled -- previously both calls shared one
-                    # try/except and a failure in the DB write silently
-                    # skipped scheduler.add_job entirely, disabling
-                    # auto-delete completely.
-                    try:
-                        scheduler.add_job(
-                            delete_sent_message, "date", run_date=run_at,
-                            args=[fresh["owner_id"], fresh["chat_id"], sent.id],
-                            id=f"del_{tid}_{sent.id}",
-                            misfire_grace_time=120
-                        )
-                    except Exception as e:
-                        logger.error(f"Job {tid}: auto-delete schedule failed: {e}")
-                    try:
-                        await add_pending_action(
-                            tid, fresh["owner_id"], fresh["chat_id"], sent.id, "delete", run_at
-                        )
-                    except Exception as e:
-                        logger.warning(f"Job {tid}: could not persist pending delete (restart-safety only): {e}")
+                if live_id is None:
+                    logger.warning(
+                        f"Job {tid}: could not find a live message to pin/track this "
+                        "cycle -- skipping pin, delete-previous tracking, and auto-delete"
+                    )
+                else:
+                    if fresh["pin"]:
+                        # FIX PIN RELIABILITY: pinning now goes through
+                        # pin_message_now(), which retries automatically on
+                        # FloodWait instead of dropping the pin after a single
+                        # failed attempt (see definition above for why this was
+                        # the actual root cause of "pin is on but never happens").
+                        await pin_message_now(fresh["owner_id"], target_int, live_id, task_id=tid)
+
+                    await update_last_msg(tid, live_id)
+
+                    off = fresh.get("auto_delete_offset", 0)
+                    if off and off > 0:
+                        run_at = datetime.datetime.now(pytz.utc) + datetime.timedelta(minutes=off)
+                        # FIX ORDERING BUG: scheduling the APScheduler job is the
+                        # part that actually makes auto-delete happen. Persisting
+                        # to userbot_pending_actions is only a safety net for
+                        # restarts. These are now two independent try/excepts so
+                        # a DB hiccup (e.g. the table not existing yet on an old
+                        # deployment) can never prevent the real deletion from
+                        # being scheduled -- previously both calls shared one
+                        # try/except and a failure in the DB write silently
+                        # skipped scheduler.add_job entirely, disabling
+                        # auto-delete completely.
+                        try:
+                            scheduler.add_job(
+                                delete_sent_message, "date", run_date=run_at,
+                                args=[fresh["owner_id"], fresh["chat_id"], live_id],
+                                id=f"del_{tid}_{live_id}",
+                                misfire_grace_time=120
+                            )
+                        except Exception as e:
+                            logger.error(f"Job {tid}: auto-delete schedule failed: {e}")
+                        try:
+                            await add_pending_action(
+                                tid, fresh["owner_id"], fresh["chat_id"], live_id, "delete", run_at
+                            )
+                        except Exception as e:
+                            logger.warning(f"Job {tid}: could not persist pending delete (restart-safety only): {e}")
 
                 if not fresh["repeat_interval"]:
                     await delete_task(tid)
